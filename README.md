@@ -51,7 +51,9 @@
 
 本仓库为**公开仓库**，青龙拉取无需 Token，也不需要配置任何访问凭证。
 
-### 1. 青龙面板添加订阅
+青龙提供两种拉库方式，任选其一。
+
+### 1. 方式一：订阅管理（图形界面）
 
 「订阅管理」→「新建订阅」，按下表填写：
 
@@ -61,18 +63,54 @@
 | 类型 | **公开仓库** |
 | 链接 | `https://github.com/Yutsuki92/qinglong-scripts.git` |
 | 分支 | `main` |
-| 白名单 | 留空（拉取全部 8 个脚本）；只订阅签到脚本可填 `_checkin\.py$`，只订阅活动脚本可填 `^(smzdm_tasks\|workbuddy_buddy_travel)\.py$` |
+| 白名单 | 留空（拉取全部 8 个脚本）；只订阅签到脚本可填 `_checkin\.py`，只订阅活动脚本可填 `smzdm_tasks\.py\|workbuddy_buddy_travel\.py` |
 | 黑名单 | 留空 |
 | 依赖文件 | 留空（本仓库不依赖公共库文件） |
 | 定时类型 | `crontab` |
 | 定时规则 | `0 0 * * *`（每天 0 点自动同步仓库更新） |
 
-### 2. 国内加速（可选）
+### 2. 方式二：拉库命令（ql repo）
 
-若面板所在网络访问 GitHub 较慢或超时，可在链接前拼接加速代理：
+青龙的订阅也支持直接粘贴命令：填进「新建订阅」的**名称**栏，或在「定时任务」里新建一条任务执行。
+
+```bash
+# 拉取全部 8 个脚本
+ql repo https://github.com/Yutsuki92/qinglong-scripts.git "" "" "" "main" "py"
+
+# 只拉签到脚本
+ql repo https://github.com/Yutsuki92/qinglong-scripts.git "_checkin\.py" "" "" "main" "py"
+
+# 只拉活动脚本
+ql repo https://github.com/Yutsuki92/qinglong-scripts.git "smzdm_tasks\.py|workbuddy_buddy_travel\.py" "" "" "main" "py"
+```
+
+参数顺序为：
 
 ```
+ql repo <仓库地址> <白名单> <黑名单> <依赖文件> <分支> <文件后缀>
+```
+
+| 参数 | 本仓库填法 |
+|---|---|
+| 仓库地址 | `https://github.com/Yutsuki92/qinglong-scripts.git` |
+| 白名单 | 留空＝全部；`_checkin\.py`＝只签到；`smzdm_tasks\.py\|workbuddy_buddy_travel\.py`＝只活动 |
+| 黑名单 | 留空 |
+| 依赖文件 | 留空（本仓库不依赖公共库文件） |
+| 分支 | `main`（**必须显式指定**：不填会去找默认的 master，本仓库没有该分支） |
+| 文件后缀 | `py` |
+
+> 定时规则（如 `0 0 * * *`）在订阅管理界面或任务的定时字段单独设置，不写在命令里。
+
+### 3. 国内加速（可选）
+
+若面板所在网络访问 GitHub 较慢或超时，在仓库地址前拼接加速代理即可：
+
+```bash
+# 订阅管理界面「链接」栏填：
 https://gh-proxy.org/https://github.com/Yutsuki92/qinglong-scripts.git
+
+# ql repo 命令写法：
+ql repo https://gh-proxy.org/https://github.com/Yutsuki92/qinglong-scripts.git "" "" "" "main" "py"
 ```
 
 公开仓库用加速站是安全的：请求不携带任何凭证，不存在 Token 泄露风险。
@@ -84,7 +122,7 @@ https://gh-proxy.org/https://github.com/Yutsuki92/qinglong-scripts.git
 https://gh-proxy.org/https://raw.githubusercontent.com/Yutsuki92/qinglong-scripts/main/aliyunpan_checkin.py
 ```
 
-### 3. 配置环境变量
+### 4. 配置环境变量
 
 订阅会把脚本同步到面板，但**账号信息必须自己配**。
 「环境变量」→「新建」逐个添加，名称见上方两张清单表。
@@ -96,7 +134,7 @@ ALIYUN_REFRESH_TOKEN = 账号1的token
                        账号2的token
 ```
 
-### 4. 依赖
+### 5. 依赖
 
 所有脚本只使用青龙自带的 `requests`，无需在「依赖管理」里安装任何第三方包。
 
