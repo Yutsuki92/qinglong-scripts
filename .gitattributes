@@ -1,0 +1,25 @@
+# 统一换行符为 LF。
+#
+# 青龙面板运行在 Linux 侧，脚本若带 CRLF（\r\n）可能出现：
+#   - 头部 cron / new Env 注释解析异常，订阅后建不出任务
+#   - 脚本内字符串比对、正则匹配带上多余的 \r 而失败
+# 因此仓库内一律存 LF，并禁止 Git 在检出时改写成 CRLF。
+* text=auto eol=lf
+
+*.py       text eol=lf
+*.js       text eol=lf
+*.json     text eol=lf
+*.md       text eol=lf
+*.txt      text eol=lf
+*.yml      text eol=lf
+*.yaml     text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+
+# 二进制文件不做任何换行转换
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.zip  binary
