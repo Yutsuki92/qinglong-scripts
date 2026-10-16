@@ -54,7 +54,7 @@ new Env('WorkBuddy 宠物探险');
     MAX_RANDOM_DELAY      启动随机延迟上限（秒），默认 600
 
 用法
-    WORKBUDDY_TOKEN=xxxx python3 workbuddy_buddy_travel.py
+    WORKBUDDY_TOKEN=xxxx python3 workbuddy_buddytravel_tasks.py
 
 输出示例
     🐱 WorkBuddy 宠物探险开始，共 2 个账号

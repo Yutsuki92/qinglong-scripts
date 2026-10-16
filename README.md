@@ -26,7 +26,7 @@
 | 脚本 | 青龙任务名 | 默认 cron | 必需环境变量 | 示例（单账号） |
 |---|---|---|---|---|
 | `smzdm_tasks.py` | 什么值得买活动 | `0 0 * * *` | `SMZDM_COOKIE` | `sess=xxxx; user=zhangsan` |
-| `workbuddy_buddy_travel.py` | WorkBuddy 宠物探险 | `30 0 * * *` | `WORKBUDDY_TOKEN` / `WORKBUDDY_TOKENS` | `123456789:eyJhbGciOiJIUzI1NiJ9...`（uid:Token） |
+| `workbuddy_buddytravel_tasks.py` | WorkBuddy 宠物探险 | `30 0 * * *` | `WORKBUDDY_TOKEN` / `WORKBUDDY_TOKENS` | `123456789:eyJhbGciOiJIUzI1NiJ9...`（uid:Token） |
 
 > 两张表的示例均为**单个账号**写法。配置**多账号时每行一个**，例如：
 >
@@ -35,10 +35,10 @@
 > user=李四; kps=xyz789; sign=uvw012; vcode=654321;
 > ```
 
-除 `workbuddy_buddy_travel.py`（宠物探险，安排在 **00:30**）外，其余脚本统一在每天 **00:00** 触发。
+除 `workbuddy_buddytravel_tasks.py`（宠物探险，安排在 **00:30**）外，其余脚本统一在每天 **00:00** 触发。
 脚本内置启动随机延迟（`MAX_RANDOM_DELAY`，默认 600 秒），会把实际请求自动分散到 00:00 ~ 00:10 之间，无需手动错峰。
 
-> `workbuddy_checkin.py` 与 `workbuddy_buddy_travel.py` 共用同一组 Token 变量
+> `workbuddy_checkin.py` 与 `workbuddy_buddytravel_tasks.py` 共用同一组 Token 变量
 > （`WORKBUDDY_TOKEN` / `WORKBUDDY_TOKENS`），只需配置一次。
 > `smzdm_checkin.py` 与 `smzdm_tasks.py` 共用 `SMZDM_COOKIE`，同样只需配置一次。
 
@@ -63,7 +63,7 @@
 | 类型 | **公开仓库** |
 | 链接 | `https://github.com/Yutsuki92/qinglong-scripts.git` |
 | 分支 | `main` |
-| 白名单 | 留空（拉取全部 8 个脚本）；只订阅签到脚本可填 `_checkin\.py`，只订阅活动脚本可填 `smzdm_tasks\.py\|workbuddy_buddy_travel\.py` |
+| 白名单 | 留空（拉取全部脚本）；只订阅签到脚本可填 `_checkin\.py`，只订阅活动脚本可填 `_tasks\.py` |
 | 黑名单 | 留空 |
 | 依赖文件 | 留空（本仓库不依赖公共库文件） |
 | 定时类型 | `crontab` |
@@ -71,17 +71,17 @@
 
 ### 2. 方式二：拉库命令（ql repo）
 
-青龙的订阅也支持直接粘贴命令：填进「新建订阅」的**名称**栏，或在「定时任务」里新建一条任务执行。
+青龙的订阅支持粘贴命令自动填表：在「新建订阅」弹窗里**直接粘贴**即可（粘贴是全局监听的，不限于名称栏）；也可以把命令放进「定时任务」新建一条任务来执行。
 
 ```bash
-# 拉取全部 8 个脚本
-ql repo https://github.com/Yutsuki92/qinglong-scripts.git "" "" "" "main" "py"
+# 拉取全部脚本
+ql repo https://github.com/Yutsuki92/qinglong-scripts.git "" "" "" "main"
 
 # 只拉签到脚本
-ql repo https://github.com/Yutsuki92/qinglong-scripts.git "_checkin\.py" "" "" "main" "py"
+ql repo https://github.com/Yutsuki92/qinglong-scripts.git "_checkin\.py" "" "" "main"
 
 # 只拉活动脚本
-ql repo https://github.com/Yutsuki92/qinglong-scripts.git "smzdm_tasks\.py|workbuddy_buddy_travel\.py" "" "" "main" "py"
+ql repo https://github.com/Yutsuki92/qinglong-scripts.git "_tasks\.py" "" "" "main"
 
 # 定时拉取（每天 0 点自动同步仓库更新）：进入「定时任务」新建一条，执行上面的命令，定时规则填 0 0 * * *
 ```
@@ -89,20 +89,16 @@ ql repo https://github.com/Yutsuki92/qinglong-scripts.git "smzdm_tasks\.py|workb
 参数顺序为：
 
 ```
-ql repo <仓库地址> <白名单> <黑名单> <依赖文件> <分支> <文件后缀>
+ql repo <仓库地址> <白名单> <黑名单> <依赖文件> <分支>
 ```
 
 | 参数 | 本仓库填法 |
 |---|---|
 | 仓库地址 | `https://github.com/Yutsuki92/qinglong-scripts.git` |
-| 白名单 | 留空＝全部；`_checkin\.py`＝只签到；`smzdm_tasks\.py\|workbuddy_buddy_travel\.py`＝只活动 |
+| 白名单 | 留空＝全部；`_checkin\.py`＝只签到；`_tasks\.py`＝只活动 |
 | 黑名单 | 留空 |
 | 依赖文件 | 留空（本仓库不依赖公共库文件） |
-| 分支 | `main`（**必须显式指定**：不填会去找默认的 master，本仓库没有该分支） |
-| 文件后缀 | `py` |
-| 定时规则 | `0 0 * * *`（每天 0 点自动同步仓库更新） |
-
-> 定时规则（如 `0 0 * * *`）在订阅管理界面或任务的定时字段单独设置，不写在命令里。
+| 分支 | `main` |
 
 ### 3. 国内加速（可选）
 
@@ -113,7 +109,7 @@ ql repo <仓库地址> <白名单> <黑名单> <依赖文件> <分支> <文件�
 https://gh-proxy.org/https://github.com/Yutsuki92/qinglong-scripts.git
 
 # ql repo 命令写法：
-ql repo https://gh-proxy.org/https://github.com/Yutsuki92/qinglong-scripts.git "" "" "" "main" "py"
+ql repo https://gh-proxy.org/https://github.com/Yutsuki92/qinglong-scripts.git "" "" "" "main"
 ```
 
 公开仓库用加速站是安全的：请求不携带任何凭证，不存在 Token 泄露风险。
@@ -178,8 +174,8 @@ rsa
 | `workbuddy_checkin.py` | `WB_USER_ID` | 空 | 兜底 `X-User-Id`，仅当无法从 Token 解析出 uid 时使用 |
 | `workbuddy_checkin.py` | `WB_WARN_DAYS` | `3` | Token 剩余天数低于该值时，日志与通知中提示尽快更新 |
 | `smzdm_tasks.py` | `SMZDM_TASK_MODULES` | `both` | 只跑指定模块：`zhongce`（众测）/ `interactive`（互动）/ `both`（全部） |
-| `workbuddy_buddy_travel.py` | `WB_TRAVEL_LOCATION` | 空 | 派出地点，填 id 或 code：`1`/`coffee`、`2`/`mall`、`3`/`gym`、`4`/`ancient_town`；留空取第一个 |
-| `workbuddy_buddy_travel.py` | `WB_USER_ID` | 空 | 同 `workbuddy_checkin.py`，两个脚本共用即可 |
+| `workbuddy_buddytravel_tasks.py` | `WB_TRAVEL_LOCATION` | 空 | 派出地点，填 id 或 code：`1`/`coffee`、`2`/`mall`、`3`/`gym`、`4`/`ancient_town`；留空取第一个 |
+| `workbuddy_buddytravel_tasks.py` | `WB_USER_ID` | 空 | 同 `workbuddy_checkin.py`，两个脚本共用即可 |
 
 > 以上变量的默认值即推荐值，通常无需配置。
 
@@ -197,7 +193,7 @@ rsa
 
 ## 注意事项
 
-- `workbuddy_buddy_travel.py`（宠物探险）单次运行可能持续 1~4 小时，取决于宠物归来时间。
+- `workbuddy_buddytravel_tasks.py`（宠物探险）单次运行可能持续 1~4 小时，取决于宠物归来时间。
   请确保面板任务超时足够长，且 cron 间隔大于单次运行时长，避免任务叠加。
 - 所有脚本的账号信息一律通过环境变量传入，**源码中不含任何密钥**，可安全纳入版本控制。
 - 本仓库为公开仓库，源码中不含任何账号凭据。请注意：**你的 Cookie / Token 只写在青龙环境变量里**，
