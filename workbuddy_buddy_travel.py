@@ -401,6 +401,18 @@ def fmt_countdown(seconds):
     return f"{h:02d}:{m:02d}:{sec:02d}"
 
 
+def fmt_elapsed(seconds):
+    """将秒数渲染为可读耗时，用于在通知里区分并行实例。"""
+    total = max(0, int(seconds))
+    h, rem = divmod(total, 3600)
+    m = rem // 60
+    if h:
+        return f"{h} 小时 {m} 分"
+    if m:
+        return f"{m} 分"
+    return f"{total} 秒"
+
+
 def fetch_status(uid, token):
     """查询宠物状态，返回 (kind, payload)。
 
@@ -671,6 +683,7 @@ def account_tag(idx, uid):
 
 def main():
     global ACCOUNT_TAG
+    started_at = time.time()
     accounts = get_accounts()
     if not accounts:
         # 未配置 Token 属配置缺失而非运行故障：正常结束，避免被青龙标记为失败。
@@ -730,7 +743,9 @@ def main():
         "WorkBuddy 宠物探险",
         f"📊 共 {len(accounts)} 个账号\n"
         f"✅ 成功: {ok}\n"
-        f"❌ 失败: {fail}"
+        f"❌ 失败: {fail}\n"
+        f"⏱️ 耗时 {fmt_elapsed(time.time() - started_at)}"
+        f"（{fmt_time(started_at)[11:16]} 启动）"
     )
     if fail > 0:
         sys.exit(1)
