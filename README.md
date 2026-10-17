@@ -12,21 +12,21 @@
 
 ### 签到脚本
 
-| 脚本 | 青龙任务名 | 默认 cron | 必需环境变量 | 示例（单账号） |
+| 脚本 | 青龙任务名 | 默认时间 | 环境变量 | 示例（单账号） |
 |---|---|---|---|---|
-| `aliyunpan_checkin.py` | 阿里云盘签到 | `0 0 * * *` | `ALIYUN_REFRESH_TOKEN` | `eyJhbGciOiJSUzI1NiIs...`（阿里云盘 refresh_token） |
-| `quark_checkin.py` | 夸克自动签到 | `0 0 * * *` | `QUARK_COOKIE` | `user=张三; kps=abc123; sign=def456; vcode=123456;` |
-| `ty_netdisk_checkin.py` | 天翼云盘签到 | `0 0 * * *` | `TY_ACCOUNTS` | `13800138000:你的密码` |
-| `enshan_checkin.py` | 恩山论坛签到 | `0 0 * * *` | `ENSHAN_COOKIE` | `cdb_sid=xxxx; cdb_auth=xxxx; saltkey=xxxx` |
-| `smzdm_checkin.py` | 什么值得买签到 | `0 0 * * *` | `SMZDM_COOKIE` | `sess=xxxx; user=zhangsan` |
-| `workbuddy_checkin.py` | WorkBuddy每日签到 | `0 0 * * *` | `WORKBUDDY_TOKEN` / `WORKBUDDY_TOKENS` | `123456789:eyJhbGciOiJIUzI1NiJ9...`（uid:Token） |
+| `aliyunpan_checkin.py` | 阿里云盘签到 | 每天 00:00 | `ALIYUN_REFRESH_TOKEN` | `eyJhbGciOiJSUzI1NiIs...` |
+| `quark_checkin.py` | 夸克自动签到 | 每天 00:00 | `QUARK_COOKIE` | `user=张三; kps=…; sign=…; vcode=…` |
+| `ty_netdisk_checkin.py` | 天翼云盘签到 | 每天 00:00 | `TY_ACCOUNTS` | `手机号:密码` |
+| `enshan_checkin.py` | 恩山论坛签到 | 每天 00:00 | `ENSHAN_COOKIE` | `cdb_sid=…; cdb_auth=…; saltkey=…` |
+| `smzdm_checkin.py` | 什么值得买签到 | 每天 00:00 | `SMZDM_COOKIE` | `sess=…; user=zhangsan` |
+| `workbuddy_checkin.py` | WorkBuddy 每日签到 | 每天 00:00 | `WORKBUDDY_TOKEN(S)` | `uid:Token` |
 
 ### 活动脚本
 
-| 脚本 | 青龙任务名 | 默认 cron | 必需环境变量 | 示例（单账号） |
+| 脚本 | 青龙任务名 | 默认时间 | 环境变量 | 示例（单账号） |
 |---|---|---|---|---|
-| `smzdm_tasks.py` | 什么值得买活动 | `0 0 * * *` | `SMZDM_COOKIE` | `sess=xxxx; user=zhangsan` |
-| `workbuddy_buddytravel_tasks.py` | WorkBuddy 宠物探险 | `30 0 * * *` | `WORKBUDDY_TOKEN` / `WORKBUDDY_TOKENS` | `123456789:eyJhbGciOiJIUzI1NiJ9...`（uid:Token） |
+| `smzdm_tasks.py` | 什么值得买活动 | 每天 00:00 | `SMZDM_COOKIE` | 同 `smzdm_checkin.py` |
+| `workbuddy_buddytravel_tasks.py` | WorkBuddy 宠物探险 | 每天 00:30 | `WORKBUDDY_TOKEN(S)` | 同 `workbuddy_checkin.py` |
 
 > 两张表的示例均为**单个账号**写法。配置**多账号时每行一个**，例如：
 >
@@ -35,7 +35,7 @@
 > user=李四; kps=xyz789; sign=uvw012; vcode=654321;
 > ```
 
-除 `workbuddy_buddytravel_tasks.py`（宠物探险，安排在 **00:30**）外，其余脚本统一在每天 **00:00** 触发。
+除宠物探险（每天 **00:30**，cron `30 0 * * *`）外，其余脚本统一在每天 **00:00**（cron `0 0 * * *`）触发。
 脚本内置启动随机延迟（`MAX_RANDOM_DELAY`，默认 600 秒），会把实际请求自动分散到 00:00 ~ 00:10 之间，无需手动错峰。
 
 > `workbuddy_checkin.py` 与 `workbuddy_buddytravel_tasks.py` 共用同一组 Token 变量
@@ -167,15 +167,15 @@ rsa
 | 脚本 | 变量 | 默认值 | 说明 |
 |---|---|---|---|
 | `aliyunpan_checkin.py` | `AUTO_UPDATE_TOKEN` | `true` | 签到后自动把刷新过的 refresh_token 写回青龙环境变量；置 `false` 关闭 |
-| `aliyunpan_checkin.py` | `PRIVACY_MODE` | `true` | 日志中的 Token 脱敏；置 `false` 显示完整值（排查问题时用） |
-| `aliyunpan_checkin.py` | `SHOW_TOKEN_IN_NOTIFICATION` | `false` | 推送通知的正文里是否包含 Token |
+|  | `PRIVACY_MODE` | `true` | 日志中的 Token 脱敏；置 `false` 显示完整值（排查问题时用） |
+|  | `SHOW_TOKEN_IN_NOTIFICATION` | `false` | 推送通知的正文里是否包含 Token |
 | `enshan_checkin.py` | `PRIVACY_MODE` | `true` | 日志中的用户名脱敏；置 `false` 显示完整用户名 |
 | `quark_checkin.py` | `QUARK_TIMEOUT` | `15` | 单次请求超时秒数；网络慢可调大 |
 | `workbuddy_checkin.py` | `WB_USER_ID` | 空 | 兜底 `X-User-Id`，仅当无法从 Token 解析出 uid 时使用 |
-| `workbuddy_checkin.py` | `WB_WARN_DAYS` | `3` | Token 剩余天数低于该值时，日志与通知中提示尽快更新 |
+|  | `WB_WARN_DAYS` | `3` | Token 剩余天数低于该值时，日志与通知中提示尽快更新 |
 | `smzdm_tasks.py` | `SMZDM_TASK_MODULES` | `both` | 只跑指定模块：`zhongce`（众测）/ `interactive`（互动）/ `both`（全部） |
 | `workbuddy_buddytravel_tasks.py` | `WB_TRAVEL_LOCATION` | 空 | 派出地点，填 id 或 code：`1`/`coffee`、`2`/`mall`、`3`/`gym`、`4`/`ancient_town`；留空取第一个 |
-| `workbuddy_buddytravel_tasks.py` | `WB_USER_ID` | 空 | 同 `workbuddy_checkin.py`，两个脚本共用即可 |
+|  | `WB_USER_ID` | 空 | 同 `workbuddy_checkin.py`，两个脚本共用即可 |
 
 > 以上变量的默认值即推荐值，通常无需配置。
 
@@ -205,15 +205,15 @@ rsa
 | 脚本 | 展示内容 |
 |---|---|
 | `workbuddy_checkin.py`、`workbuddy_buddytravel_tasks.py` | 解析 JWT 的 `exp`：`剩余 27.0 天（至 2026-11-13 18:10）`；低于 `WB_WARN_DAYS` 加 ⚠️ |
-| `aliyunpan_checkin.py` | access_token 有效期（服务端 `expires_in`）+ refresh_token 长期有效说明 |
-| `quark_checkin.py` | kps/sign/vcode 无到期字段，随登录态失效 |
-| `ty_netdisk_checkin.py` | 账号密码登录，会话 Cookie 随任务结束失效，无需维护 |
+| `aliyunpan_checkin.py` | `access 2.0 小时（自动刷新）｜refresh 长期有效` |
+| `quark_checkin.py` | `无到期字段，失效后重抓 QUARK_COOKIE`（消息末尾统一说明） |
+| `ty_netdisk_checkin.py` | 账号密码登录，会话随任务结束失效，不在通知中占用篇幅 |
 | `enshan_checkin.py`、`smzdm_checkin.py`、`smzdm_tasks.py` | Cookie 无到期字段，只报当前登录态正常 / 已失效 |
 
 单账号通知示例（WorkBuddy）：
 
 ```
-✅ [12345678…] 签到成功 +10 积分
+✅ [12345678…] 签到成功
     🎁 获得：积分 +10 | 连签 6 天 | 累计 1290 | 连签奖励
     🕐 签到时间：2026-10-17 18:10:05（耗时 1.0 秒）
     🔑 Token 有效期：剩余 27.0 天（至 2026-11-13 18:10）
