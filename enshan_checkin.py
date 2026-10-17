@@ -168,9 +168,11 @@ def extract_number(text):
 
 
 def format_duration(seconds):
-    """把秒数格式化为 x小时x分x秒。"""
+    """把秒数格式化为 x小时x分x秒；不足 1 分钟保留一位小数。"""
     if seconds <= 0:
         return '0秒'
+    if seconds < 60:
+        return f'{seconds:.1f}秒'
     hours, minutes = divmod(int(seconds), 3600)
     minutes, secs = divmod(minutes, 60)
     if hours:
@@ -178,6 +180,11 @@ def format_duration(seconds):
     if minutes:
         return f'{minutes}分{secs}秒'
     return f'{secs}秒'
+
+
+def fmt_clock(ts=None):
+    """时间戳渲染为 YYYY-MM-DD HH:MM:SS。"""
+    return datetime.fromtimestamp(ts if ts else time.time()).strftime('%Y-%m-%d %H:%M:%S')
 
 
 def parse_cookies(cookie_str):
@@ -677,6 +684,9 @@ class EnShanSigner:
         self.cookie_valid = None      # None=未验证 / True / False
         self.cookie_note = ''         # 校验结论说明
         self.waf_failed = False       # 失败是否源于 WAF 挑战环节
+        self.signed_at = None         # 确认签到成功的时刻（失败/未知时为 None）
+        self.sign_state = None        # success / already / unknown / fail
+        self.credit_gain = None       # 签到前后恩山币差值，失败时为 None
 
     # 日志带账号序号，多账号时不混淆
     def _log(self, msg, level=logging.INFO):
@@ -958,13 +968,16 @@ class EnShanSigner:
         if not self.formhash:
             ok, msg = self.login()
             if not ok:
-                return False, msg
+                return False, msg, 'fail'
 
         # 签到前再刷新一次，降低 WAF Cookie 过期导致的失败。
         # 这只是「顺手刷新」，formhash 已在 login 阶段拿到，失败不影响主流程。
         _ok, _refresh_msg, _waf = self._refresh_clearance_cookie()
         if _ok:
             self._log('签到前已刷新签到参数')
+        elif _waf:
+            # 刷新阶段就被 WAF 拦下：记下来，供失败归因使用
+            self.waf_failed = True
 
         headers = {
             'User-Agent': UA,
@@ -995,19 +1008,20 @@ class EnShanSigner:
         try:
             result = response.json()
             if not isinstance(result, dict):
-                return True, '签到请求已提交'
+                return False, '签到请求已提交（接口未返回可识别结果，结果未知）', 'unknown'
         except ValueError:
             # 非 JSON（常见于 WAF 拦截页或站点维护页），截断后再判断
             text = (response.text or '').strip()
             if response.status_code != 200:
-                return False, f'签到接口返回状态码 {response.status_code}'
+                return False, f'签到接口返回状态码 {response.status_code}', 'fail'
             if any(hint in text for hint in NEED_LOGIN_HINTS):
                 self.cookie_valid = False
                 self.cookie_note = MSG_COOKIE_EXPIRED
-                return False, MSG_COOKIE_EXPIRED
-            # 无法判定成功与否，按已提交处理，交由积分复核确认
+                return False, MSG_COOKIE_EXPIRED, 'fail'
+            # 既没拿到 JSON 也没有明确失败信号：标为「结果未知」，
+            # 不能当成签到成功，留给积分复核判定。
             self._log(f'签到接口返回非 JSON（前 120 字）：{text[:120]}', logging.WARNING)
-            return True, '签到请求已提交（接口未返回 JSON）'
+            return False, '签到请求已提交（接口未返回 JSON，结果未知）', 'unknown'
 
         message = str(result.get('message', '')).strip()
         status = result.get('status')
@@ -1016,59 +1030,83 @@ class EnShanSigner:
         if any(hint in message for hint in NEED_LOGIN_HINTS):
             self.cookie_valid = False
             self.cookie_note = MSG_COOKIE_EXPIRED
-            return False, MSG_COOKIE_EXPIRED
+            return False, MSG_COOKIE_EXPIRED, 'fail'
 
-        if result.get('success') is True or status in (1, '1', 'success', True):
-            return True, message or '签到成功'
         if '已签到' in message or '已经签到' in message:
-            return True, message
+            return True, message, 'already'
+        if result.get('success') is True or status in (1, '1', 'success', True):
+            return True, message or '签到成功', 'success'
         if '成功' in message:
-            return True, message
+            return True, message, 'success'
         if message:
-            return False, f'签到失败：{message}'
-        return True, '签到请求已提交'
+            return False, f'签到失败：{message}', 'fail'
+        return False, '签到请求已提交（接口未返回明确结果，结果未知）', 'unknown'
 
     def run(self):
         """单账号完整流程，返回 (message, success, already)。"""
         if not self.cookie.strip():
+            self.sign_state = 'fail'
             return 'Cookie 为空', False, False
 
         ok, msg = self.login()
         if not ok:
+            self.sign_state = 'fail'
             return msg, False, False
+
+        # 登录成功说明 WAF 已通过（含回退路径），不再把它算作失败归因
+        self.waf_failed = False
 
         self.fetch_user_info(is_after=False)
         time.sleep(random.uniform(2, 5))
 
-        success, sign_msg = self.sign()
-        already = False
+        success, sign_msg, state = self.sign()
+        # 只有确认成功/已签到时才记录「签到时间」；
+        # 失败或结果未知时留空，展示端回落为「完成时间」。
+        if state in ('success', 'already'):
+            self.signed_at = time.time()
+        already = (state == 'already')
+        self.sign_state = state
 
         time.sleep(random.uniform(2, 4))
         after_ok, _ = self.fetch_user_info(is_after=True)
 
-        # 以积分变化复核签到结果
+        # 以积分变化复核签到结果（仅在拿到前后积分时生效）
         if after_ok and self.credit_before and self.credit_after:
             before_n = extract_number(self.credit_before)
             after_n = extract_number(self.credit_after)
-            gain = after_n - before_n
-            self._log(f'恩山币变化：{before_n} → {after_n}（{gain:+d}）')
-            if gain > 0:
-                success = True
-                sign_msg = f'签到成功，获得 {gain} 恩山币'
-            elif gain == 0 and success:
-                already = True
+            self.credit_gain = after_n - before_n
+            self._log(f'恩山币变化：{before_n} → {after_n}（{self.credit_gain:+d}）')
+            if self.credit_gain > 0:
+                # 有正向增量是硬证据，可把「未知」升级为「成功」
+                success, state = True, 'success'
+                prefix = '签到成功（此前已签到）' if already else '签到成功'
+                sign_msg = f'{prefix}，获得 {self.credit_gain} 恩山币'
+            elif self.credit_gain == 0 and state == 'success' and (
+                    '已签到' in sign_msg or '已经签到' in sign_msg):
+                # 只有接口明确说过「已签到」才降级；否则保持成功，
+                # 避免奖励延迟到账被误判成「今日已签到」。
+                already, state = True, 'already'
                 sign_msg = '今日已签到（积分无变化）'
+            # state == 'unknown' 时积分无变化不足以证明已签到，保持未知
+            self.sign_state = state
 
         return sign_msg, success, already
 
 
 # ---------------- 结果渲染 ----------------
 def count_results(results):
-    """统计口径，返回 (total, success, already, failed)。"""
+    """统计口径，返回 (total, success, already, failed, unknown)。
+
+    完全按 sign_state 分档，避免「unknown 同时被算进 success」
+    导致「本次新签」虚增、失败数变负。
+    success 含 already，故「本次新签 = success - already」。
+    """
     total = len(results)
-    success = sum(1 for r in results if r['success'])
-    already = sum(1 for r in results if r['already'])
-    return total, success, already, total - success
+    success = sum(1 for r in results if r.get('state') in ('success', 'already'))
+    already = sum(1 for r in results if r.get('state') == 'already')
+    unknown = sum(1 for r in results if r.get('state') == 'unknown')
+    failed = total - success - unknown
+    return total, success, already, failed, unknown
 
 
 def cookie_line(r):
@@ -1085,8 +1123,12 @@ def cookie_line(r):
 
 def result_lines(r, indent=''):
     """单个账号的展示行，日志与通知共用。"""
-    # WAF 异常属站点侧问题，用警示符号区别于真正的签到失败
-    if r['already']:
+    # WAF 异常属站点侧问题，用警示符号区别于真正的签到失败；
+    # 结果未知同样用警示符号，不能显示成 ✅。
+    state = r.get('state')
+    if state == 'unknown':
+        head = f"{indent}⚠️ [{r['tag']}] {r['message']}"
+    elif r['already']:
         head = f"{indent}📅 [{r['tag']}] {r['message']}"
     elif r['success']:
         head = f"{indent}✅ [{r['tag']}] {r['message']}"
@@ -1095,41 +1137,68 @@ def result_lines(r, indent=''):
     else:
         head = f"{indent}❌ [{r['tag']}] {r['message']}"
     lines = [head]
-    if r.get('user_name'):
-        lines.append(f"{indent}    👤 {mask_username(r['user_name'])}  "
-                     f"等级 {r.get('user_group') or '未知'}")
-    if r.get('credit_before') or r.get('credit_after'):
-        lines.append(f"{indent}    💰 恩山币 {r.get('credit_before') or '未知'} → "
-                     f"{r.get('credit_after') or r.get('credit_before') or '未知'}")
+    gain = r.get('credit_gain')
+    before, after = r.get('credit_before'), r.get('credit_after')
+    bal = f"（余额 {after or before}）" if (before or after) else ""
+    if gain is None:
+        lines.append(f"{indent}    🎁 今日获得：未知{bal or '（未取到积分）'}")
+    elif gain > 0:
+        lines.append(f"{indent}    🎁 今日获得：+{gain} 恩山币{bal}")
+    elif r.get('already'):
+        lines.append(f"{indent}    🎁 今日获得：无新增（今日已签到）{bal}")
+    elif r.get('state') == 'unknown':
+        lines.append(f"{indent}    🎁 今日获得：未知（签到结果未确认）{bal}")
+    elif r['success']:
+        lines.append(f"{indent}    🎁 今日获得：无新增（奖励可能延迟到账）{bal}")
+    else:
+        lines.append(f"{indent}    🎁 今日获得：无（签到未成功）{bal}")
+
+    when = r.get('signed_at') or r.get('finished_at')
+    if when:
+        label = '🕐 签到时间' if r.get('signed_at') else '🕐 完成时间'
+        elapsed = r.get('elapsed')
+        suffix = f"（耗时 {format_duration(elapsed)}）" if elapsed is not None else ""
+        lines.append(f"{indent}    {label}：{fmt_clock(when)}{suffix}")
+
     lines.append(f"{indent}    🔑 Cookie：{cookie_line(r)}")
     return lines
 
 
-def build_notification(results, counts, warnings=None):
+def build_notification(results, counts, warnings=None, started_at=None):
     """构造通知标题与正文。"""
-    total, success, already, failed = counts
+    total, success, already, failed, unknown = counts
     waf_only = [r for r in results if not r['success'] and r.get('waf_failed')]
 
-    if failed == 0:
+    if failed == 0 and unknown == 0:
         title = '恩山论坛签到成功'
-    elif success == 0 and len(waf_only) == failed:
+    elif failed == 0 and unknown > 0:
+        # 没有失败账号，只是部分账号结果不确定
+        title = '恩山论坛签到完成（部分结果未知）'
+    elif success == 0 and unknown == 0 and len(waf_only) == failed:
         # 全部失败都源于 WAF，属站点问题，不误导为账号/Cookie 故障
         title = '恩山论坛签到受阻（站点 WAF 异常）'
-    elif success == 0:
+    elif success == 0 and unknown == 0:
         title = '恩山论坛签到失败'
+    elif success == 0:
+        title = '恩山论坛签到结果未知'
     else:
         title = '恩山论坛签到部分失败'
 
     lines = [
-        f'总账号数：{total}',
-        f'本次新签：{success - already}',
-        f'今日已签：{already}',
-        f'签到失败：{failed}',
-        '',
-        '详细结果：',
+        f'📊 {total} 个账号｜本次新签 {success - already}｜'
+        f'今日已签 {already}｜失败 {failed}'
+        + (f'｜未知 {unknown}' if unknown else '')
     ]
+    gains = [r.get('credit_gain') for r in results if (r.get('credit_gain') or 0) > 0]
+    if gains:
+        lines.append(f'🎁 合计获得：+{sum(gains)} 恩山币')
+    if started_at:
+        lines.append(f'⏱️ 耗时：{format_duration(time.time() - started_at)}')
+    lines += ['', '详细结果：']
     for r in results:
         lines.extend(result_lines(r))
+
+    lines += ['', '🔑 Cookie 无到期字段，失效后需重新抓取']
 
     if warnings:
         lines += ['', '提醒：'] + [f'  · {w}' for w in warnings]
@@ -1142,7 +1211,7 @@ def build_notification(results, counts, warnings=None):
 
 def print_summary(results):
     """打印执行结果统计。"""
-    total, success, already, failed = count_results(results)
+    total, success, already, failed, unknown = count_results(results)
     log('=' * 50)
     log('执行结果统计')
     log('=' * 50)
@@ -1150,12 +1219,14 @@ def print_summary(results):
     log(f'本次新签：{success - already}')
     log(f'今日已签：{already}')
     log(f'签到失败：{failed}')
+    if unknown:
+        log(f'结果未知：{unknown}')
     log('详细结果：')
     for r in results:
         for line in result_lines(r, indent='  '):
             log(line)
     log('=' * 50)
-    return total, success, already, failed
+    return total, success, already, failed, unknown
 
 
 def main():
@@ -1196,37 +1267,48 @@ def main():
             time.sleep(delay)
 
         signer = EnShanSigner(cookie, idx)
+        t0 = time.time()
         try:
             message, success, already = signer.run()
         except Exception as e:
             message, success, already = f'执行异常：{type(e).__name__}: {e}', False, False
+            # 异常时状态可能已被 run() 写成 success，必须覆盖，
+            # 否则统计会按 state 把这个账号算成成功。
+            signer.sign_state = 'fail'
+            signer.signed_at = None
+        elapsed = time.time() - t0
 
+        if signer.user_name:
+            tag = f'账号{idx}({mask_username(signer.user_name)})'
         if signer.cookie_valid is False:
             warnings.append(f'{tag} {MSG_COOKIE_EXPIRED}')
         elif signer.waf_failed:
             warnings.append(f'{tag} {MSG_WAF_FAILED}')
-        if signer.user_name:
-            tag = mask_username(signer.user_name)
 
         results.append({
             'tag': tag,
             'success': success,
             'already': already,
+            'state': signer.sign_state,
             'message': message,
             'user_name': signer.user_name,
             'user_group': signer.user_group,
             'credit_before': signer.credit_before,
             'credit_after': signer.credit_after,
+            'credit_gain': signer.credit_gain,
             'cookie_valid': signer.cookie_valid,
             'waf_failed': signer.waf_failed,
+            'signed_at': signer.signed_at,
+            'finished_at': time.time(),
+            'elapsed': elapsed,
         })
 
-    counts = count_results(results)
-    print_summary(results)
-    notify(*build_notification(results, counts, warnings))
+    counts = print_summary(results)
+    notify(*build_notification(results, counts, warnings, started_at=start.timestamp()))
 
     log(f'任务完成，耗时 {format_duration((datetime.now() - start).total_seconds())}')
-    if counts[3] > 0:
+    # 结果未知也要非零退出：多半是站点返回结构变了，需要人看一眼
+    if counts[3] > 0 or counts[4] > 0:
         sys.exit(1)
 
 

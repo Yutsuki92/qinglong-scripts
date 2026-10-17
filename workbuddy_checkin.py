@@ -23,6 +23,7 @@ import random
 import base64
 import logging
 import traceback
+from datetime import datetime
 
 try:
     import requests
@@ -139,6 +140,34 @@ def format_remaining(seconds):
         if n >= secs:
             return f"{prefix}{n / secs:.1f} {unit}"
     return f"{prefix}{n // 60} 分钟"
+
+
+def token_expire_at(token):
+    """解析 JWT exp，返回本地到期时刻（YYYY-MM-DD HH:MM）；无法解析返回空串。"""
+    try:
+        exp = decode_jwt(token).get("exp")
+        if not exp:
+            return ""
+        return datetime.fromtimestamp(int(exp)).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return ""
+
+
+def fmt_elapsed(seconds):
+    """耗时渲染：1.2 秒 / 3 分 05 秒 / 1 小时 02 分 09 秒。"""
+    total = max(0.0, float(seconds or 0))
+    if total < 60:
+        return f"{total:.1f} 秒"
+    minutes, secs = divmod(int(round(total)), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours} 小时 {minutes:02d} 分 {secs:02d} 秒"
+    return f"{minutes} 分 {secs:02d} 秒"
+
+
+def fmt_clock(ts=None):
+    """时间戳渲染为 YYYY-MM-DD HH:MM:SS。"""
+    return datetime.fromtimestamp(ts if ts else time.time()).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def token_expiry_warning(token):
@@ -290,6 +319,10 @@ def new_result(token):
         "is_streak_day": False,
         "status_info": {},
         "token_remaining": token_remaining(token),
+        "token_exp_at": token_expire_at(token),
+        "checked_at": None,   # 真正执行签到的时刻
+        "finished_at": None,  # 该账号处理结束的时刻
+        "elapsed": None,      # 该账号耗时（秒）
         "tag": "",
     }
 
@@ -343,12 +376,12 @@ def checkin_one(uid, token):
         d = res.get("data") or {}
         # 签到接口字段优先，缺失时回退到状态接口
         result["success"] = True
+        result["checked_at"] = time.time()
         result["credit"] = d.get("credit", status.get("daily_credit"))
         result["streak_days"] = d.get("streak_days", status.get("streak_days"))
         result["total_credits"] = d.get("total_credits", status.get("total_credits"))
         result["is_streak_day"] = bool(d.get("is_streak_day", status.get("is_streak_day")))
-        credit = result["credit"] if result["credit"] is not None else 0
-        result["message"] = f"签到成功 +{credit} 积分"
+        result["message"] = "签到成功"
         return result
 
     # 接口以 HTTP 400 + code 10001 表示今日已签
@@ -390,25 +423,38 @@ def format_detail(r):
 
 
 def format_token_line(r):
-    """Token 有效期行。"""
+    """Token 有效期行：剩余时长 + 到期时刻 + 预警。"""
     left = r.get("token_remaining")
+    exp_at = r.get("token_exp_at") or ""
     warn = ""
     if left is not None:
         if left <= 0:
             warn = "  ⚠️ 已过期"
         elif left / 86400.0 <= WARN_DAYS:
             warn = "  ⚠️ 即将过期"
-    return f"Token 有效期：{format_remaining(left)}{warn}"
+    text = f"🔑 Token 有效期：{format_remaining(left)}{warn}"
+    if exp_at:
+        text += f"（至 {exp_at}）"
+    return text
 
 
 def result_lines(r, indent=""):
     """单个账号的完整展示行，日志与通知共用。"""
     lines = [f"{indent}{'✅' if r['success'] else '❌'} [{r['tag']}] {r['message']}"]
-    if r.get("token_remaining") is not None:
-        lines.append(f"{indent}    {format_token_line(r)}")
+
     detail = format_detail(r)
     if detail:
-        lines.append(f"{indent}    {detail}")
+        lines.append(f"{indent}    🎁 获得：{detail}")
+
+    when = r.get("checked_at") or r.get("finished_at")
+    if when:
+        elapsed = r.get("elapsed")
+        suffix = f"（耗时 {fmt_elapsed(elapsed)}）" if elapsed is not None else ""
+        label = "🕐 签到时间" if r.get("checked_at") else "🕐 完成时间"
+        lines.append(f"{indent}    {label}：{fmt_clock(when)}{suffix}")
+
+    if r.get("token_remaining") is not None or r.get("token_exp_at"):
+        lines.append(f"{indent}    {format_token_line(r)}")
     return lines
 
 
@@ -430,7 +476,7 @@ def print_summary(results):
     return total, success, already, failed
 
 
-def build_notification(results, counts, warnings=None):
+def build_notification(results, counts, warnings=None, started_at=None):
     """构造通知标题与正文。"""
     total, success, already, failed = counts
     if failed == 0:
@@ -441,13 +487,12 @@ def build_notification(results, counts, warnings=None):
         title = "WorkBuddy 签到部分失败"
 
     lines = [
-        f"总账号数：{total}",
-        f"本次新签：{success - already}",
-        f"今日已签：{already}",
-        f"签到失败：{failed}",
-        "",
-        "详细结果：",
+        f"📊 {total} 个账号｜本次新签 {success - already}｜"
+        f"今日已签 {already}｜失败 {failed}"
     ]
+    if started_at:
+        lines.append(f"⏱️ 总耗时：{fmt_elapsed(time.time() - started_at)}")
+    lines += ["", "详细结果："]
     for r in results:
         lines.extend(result_lines(r))
 
@@ -485,8 +530,10 @@ def main():
         log(f"⚠️ {w}", logging.WARNING)
 
     results = []
+    started_at = time.time()
     for idx, (uid, token) in enumerate(accounts, 1):
         tag = account_tag(uid, idx)
+        t0 = time.time()
         try:
             r = checkin_one(uid, token)
         except Exception as e:
@@ -494,6 +541,8 @@ def main():
             r = new_result(token)
             r["message"] = f"异常：{type(e).__name__}: {e}"
         r["tag"] = tag
+        r["finished_at"] = time.time()
+        r["elapsed"] = r["finished_at"] - t0
         results.append(r)
 
         status = r["status_info"]
@@ -502,8 +551,11 @@ def main():
             f"累计积分：{status.get('total_credits', 0)}")
         left = r.get("token_remaining")
         overdue = left is not None and left <= WARN_DAYS * 86400
-        log(f"🔑 [{tag}] Token {format_remaining(left)}" + ("  ⚠️ 请尽快更新" if overdue else ""))
+        log(f"🔑 [{tag}] Token {format_remaining(left)}"
+            f"{'（至 ' + r['token_exp_at'] + '）' if r.get('token_exp_at') else ''}"
+            + ("  ⚠️ 请尽快更新" if overdue else ""))
         log(("✅ " if r["success"] else "❌ ") + f"[{tag}] {r['message']}")
+        log(f"⏱️ [{tag}] 耗时 {fmt_elapsed(r['elapsed'])}")
 
         if idx < len(accounts) and random_signin:
             delay = random.uniform(10, 20)
@@ -512,7 +564,7 @@ def main():
 
     counts = count_results(results)
     print_summary(results)
-    notify(*build_notification(results, counts, warnings))
+    notify(*build_notification(results, counts, warnings, started_at))
 
     if counts[3] > 0:
         sys.exit(1)

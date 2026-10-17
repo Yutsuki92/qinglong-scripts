@@ -413,6 +413,26 @@ def fmt_elapsed(seconds):
     return f"{total} 秒"
 
 
+def token_validity_line(token):
+    """Token 有效期行：剩余时长 + 到期时刻。"""
+    try:
+        part = token.split(".")[1]
+        part += "=" * (-len(part) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(part).decode("utf-8", "ignore"))
+        exp = int(payload.get("exp") or 0)
+    except Exception:
+        exp = 0
+
+    if not exp:
+        return "🔑 Token 有效期：无法解析（Token 非 JWT，无 exp 字段）"
+
+    left = exp - int(time.time())
+    exp_str = fmt_time(exp)
+    if left <= 0:
+        return f"🔑 Token 有效期：已过期（至 {exp_str}）⚠️ 请重新登录更新 WORKBUDDY_TOKEN"
+    return f"🔑 Token 有效期：剩余 {left / 86400:.1f} 天（至 {exp_str}）"
+
+
 def fetch_status(uid, token):
     """查询宠物状态，返回 (kind, payload)。
 
@@ -434,28 +454,34 @@ def fetch_status(uid, token):
 
 
 def do_claim(uid, token, status_data=None):
-    """领取归来奖励，返回 (ok, msg)。
+    """领取归来奖励，返回 (status, msg)。
 
-    「无可领取奖励」视为正常结果：多账号或多次运行下重复调用 claim 必然遇到。
+    status 三态：
+      "ok"   真正领到了积分
+      "skip" 无可领取（已领过 / 今日上限等）—— 正常结果，不计成功也不计失败
+      "fail" 接口失败
+
+    积分只取 claim 响应里的实际到账值；缺失时如实说明，
+    不能用状态接口的 reward_credit（那是预期区间）冒充已领取数量。
     """
     ck_code, ck_text = http("POST", API_BASE + CLAIM_EP, token, uid, "{}")
     if ck_code == 401:
-        return False, auth_fail_msg(token)
+        return "fail", auth_fail_msg(token)
     if ck_code == 0:
-        return False, f"领取接口网络请求失败：{ck_text}"
+        return "fail", f"领取接口网络请求失败：{ck_text}"
     try:
         ck = json.loads(ck_text)
     except Exception:
-        return False, f"领取接口返回异常（{ck_code}）：{ck_text[:120]}"
+        return "fail", f"领取接口返回异常（{ck_code}）：{ck_text[:120]}"
     if ck.get("code") == 0:
         d = ck.get("data") or {}
-        src = status_data or {}
-        credit = (d.get("credit") or d.get("reward_credit")
-                  or src.get("reward_credit") or 0)
-        return True, f"🎉 已领取积分 +{credit}"
+        credit = d.get("credit")
+        if credit is None:
+            return "ok", "🎉 已领取奖励（接口未返回积分数量）"
+        return "ok", f"🎉 已领取积分 +{credit}"
     if is_no_claim_msg(ck.get("msg")):
-        return True, "宠物已归来，但无可领取奖励（可能已领取过）"
-    return False, f"领取失败 code={ck.get('code')} msg={ck.get('msg', '')}"
+        return "skip", "宠物已归来，但无可领取奖励（可能已领取过）"
+    return "fail", f"领取失败 code={ck.get('code')} msg={ck.get('msg', '')}"
 
 
 def remaining_seconds(arrive, data):
@@ -476,8 +502,9 @@ def wait_and_claim(uid, token, data):
     """等待宠物归来并领取奖励，期间每 POLL_INTERVAL 秒输出一次倒计时。
 
     适用于本轮开始时宠物已在探险中，或刚由本脚本派出。
+    返回 (status, msg)，status 见 do_claim 的三态说明。
 
-    截止时间为「归来时刻 + 10 分钟」，超时不计为失败，奖励保留至下次运行领取。
+    截止时间为「归来时刻 + 10 分钟」；超时不判失败，标为 skip，奖励保留至下次运行。
     接口未返回归来时间时本轮不等待，直接退出。
     """
     d = data or {}
@@ -488,8 +515,8 @@ def wait_and_claim(uid, token, data):
     log("")
     if not arrive:
         log(f"🐾 探险中（{loc_name}），接口未返回归来时间")
-        return True, (f"🐾 探险中（{loc_name}），接口未返回归来时间，本轮不等待；"
-                      f"奖励保留，下次运行领取")
+        return "skip", (f"🐾 探险中（{loc_name}），接口未返回归来时间，本轮不等待；"
+                        f"奖励保留，下次运行领取")
 
     started = time.time()
     left = remaining_seconds(arrive, d)
@@ -505,8 +532,8 @@ def wait_and_claim(uid, token, data):
         budget = deadline - time.time()
         if budget <= 0:
             log("")
-            return True, (f"⏰ 等待超时（已等 {fmt_countdown(time.time() - started)}），"
-                          f"奖励保留，下次运行继续领取")
+            return "skip", (f"⏰ 等待超时（已等 {fmt_countdown(time.time() - started)}），"
+                            f"奖励保留，下次运行继续领取")
         sleep_for = min(POLL_INTERVAL, budget)
         # 不把整段间隔睡过归来时刻，保证归零后立即领取。
         left = remaining_seconds(arrive, d)
@@ -518,7 +545,7 @@ def wait_and_claim(uid, token, data):
         kind, payload = fetch_status(uid, token)
         if kind != "ok":
             log("")
-            return False, payload
+            return "fail", payload
         data = payload
         d = data
         if data.get("arrive_at"):
@@ -533,7 +560,7 @@ def wait_and_claim(uid, token, data):
         if state == "idle":
             # 探险结束且状态已回到空闲：奖励通常已被领取。
             log("")
-            return True, "宠物探险已结束（状态空闲，奖励可能已领取）"
+            return "skip", "宠物探险已结束（状态空闲，奖励可能已领取）"
 
         if state == "traveling":
             if left > 0:
@@ -547,7 +574,8 @@ def wait_and_claim(uid, token, data):
             continue
 
         log("")
-        return True, f"等待中收到未知状态 {state!r}，本轮结束"
+        # 未知状态说明接口结构可能变了，不能当成「跳过」蒙混过去
+        return "fail", f"等待中收到未知状态 {state!r}，本轮结束"
 
 
 def prepare_one(uid, token):
@@ -578,7 +606,8 @@ def prepare_one(uid, token):
         return {"kind": "wait", "data": data}
 
     if state != "idle":
-        return {"kind": "done", "msg": f"宠物状态未知：{state}"}
+        # 接口没给出已知状态（含 state 缺失），属结构异常而非正常跳过
+        return {"kind": "fatal", "msg": f"宠物状态未知：{state!r}"}
     if data.get("daily_limit_reached"):
         return {"kind": "done", "msg": "😴 今日派出已达上限，跳过"}
 
@@ -639,27 +668,32 @@ def prepare_one(uid, token):
 
 
 def finish_one(uid, token, job):
-    """阶段二：执行阶段一派发的任务，返回 (是否正常, 消息)。"""
+    """阶段二：执行阶段一派发的任务，返回 (status, 消息)。
+
+    status 三态见 do_claim：只有真正领到积分才算 ok，"已领取过/今日上限/
+    未激活宠物/等待超时"一律算 skip，避免把"什么都没做"报成成功。
+    """
     kind = job.get("kind")
     if kind == "fatal":
-        return False, job.get("msg", "")
+        return "fail", job.get("msg", "")
     if kind == "done":
-        return True, job.get("msg", "")
+        return "skip", job.get("msg", "")
     if kind == "claim":
         return do_claim(uid, token, job.get("data") or {})
 
     # 待等待的账号：以最新状态为准，避免沿用阶段一的旧响应。
     st_kind, payload = fetch_status(uid, token)
     if st_kind != "ok":
-        return False, payload
+        return "fail", payload
     state = payload.get("state")
     if state == "arrived":
         return do_claim(uid, token, payload)
     if state == "traveling":
         return wait_and_claim(uid, token, payload)
     if state == "idle":
-        return True, "宠物探险已结束（状态空闲，奖励可能已领取）"
-    return True, f"等待前收到未知状态：{state}"
+        return "skip", "宠物探险已结束（状态空闲，奖励可能已领取）"
+    # 未知状态（含 state 缺失）说明接口结构异常，判失败而不是跳过
+    return "fail", f"等待前收到未知状态：{state!r}"
 
 
 def _wait_with_countdown(seconds, task_name):
@@ -722,31 +756,59 @@ def main():
     ACCOUNT_TAG = ""
     log("")
     log("⏳ 第 2 步：依次等待领取")
-    ok, fail = 0, 0
+    ok, skip, fail = 0, 0, 0
+    icon = {"ok": "✅", "skip": "⏭️", "fail": "❌"}
+    details = []
     for idx, (uid, token, job) in enumerate(jobs, 1):
         ACCOUNT_TAG = account_tag(idx, uid)
+        t0 = time.time()
         try:
-            success, msg = finish_one(uid, token, job)
+            status, msg = finish_one(uid, token, job)
         except Exception as e:
-            success, msg = False, f"异常：{e}"
-        if success:
+            status, msg = "fail", f"异常：{e}"
+        if status not in icon:
+            status = "fail"
+        elapsed = time.time() - t0
+        if status == "ok":
             ok += 1
-            log(f"✅ {msg}")
+        elif status == "skip":
+            skip += 1
         else:
             fail += 1
-            log(f"❌ {msg}")
+        log(f"{icon[status]} {msg}")
+        log(f"⏱️ 本账号耗时 {fmt_elapsed(elapsed)}")
+        details.append({
+            "tag": ACCOUNT_TAG,
+            "status": status,
+            "msg": msg,
+            "elapsed": elapsed,
+            "finished": time.time(),
+            "token": token,
+        })
 
     ACCOUNT_TAG = ""
     log("")
-    log(f"🏁 完成：成功 {ok} / 失败 {fail} / 共 {len(accounts)}")
-    notify(
-        "WorkBuddy 宠物探险",
-        f"📊 共 {len(accounts)} 个账号\n"
-        f"✅ 成功: {ok}\n"
-        f"❌ 失败: {fail}\n"
-        f"⏱️ 耗时 {fmt_elapsed(time.time() - started_at)}"
-        f"（{fmt_time(started_at)[11:16]} 启动）"
-    )
+    log(f"🏁 完成：成功 {ok} / 跳过 {skip} / 失败 {fail} / 共 {len(accounts)}")
+    total_elapsed = time.time() - started_at
+    lines = [
+        f"📊 共 {len(accounts)} 个账号｜✅ 成功 {ok}｜⏭️ 跳过 {skip}｜❌ 失败 {fail}",
+        f"⏱️ 总耗时 {fmt_elapsed(total_elapsed)}",
+    ]
+    if ok == 0 and skip > 0:
+        # 全部跳过时别让汇总看起来像“一切正常”
+        lines.append("⚠️ 本轮没有领到任何奖励（全部账号为跳过），请检查宠物状态是否激活")
+    if details:
+        lines += ["", "——— 账号明细 ———"]
+        for d in details:
+            lines.append(f"{icon[d['status']]} [{d['tag']}] {d['msg']}")
+            lines.append(f"    🕐 完成时间：{fmt_time(d['finished'])}"
+                         f"（本账号耗时 {fmt_elapsed(d['elapsed'])}）")
+            lines.append(f"    {token_validity_line(d['token'])}")
+
+    content = "\n".join(lines)
+    if len(content) > 1800:
+        content = content[:1800] + "\n…（内容过长已截断）"
+    notify("WorkBuddy 宠物探险", content)
     if fail > 0:
         sys.exit(1)
 

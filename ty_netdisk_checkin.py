@@ -77,6 +77,24 @@ def notify(title, content, timeout=NOTIFY_TIMEOUT):
     t.join(timeout)
     return result["ok"]
 
+# ---------------- 通知内容辅助 ----------------
+def fmt_elapsed(seconds):
+    """把耗时秒数渲染成易读文本：1.2 秒 / 3 分 05 秒 / 1 小时 02 分 09 秒。"""
+    total = max(0.0, float(seconds or 0))
+    if total < 60:
+        return f"{total:.1f} 秒"
+    minutes, secs = divmod(int(round(total)), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours} 小时 {minutes:02d} 分 {secs:02d} 秒"
+    return f"{minutes} 分 {secs:02d} 秒"
+
+
+def fmt_clock(ts=None):
+    """时间戳渲染为 YYYY-MM-DD HH:MM:SS。"""
+    return datetime.fromtimestamp(ts if ts else time.time()).strftime('%Y-%m-%d %H:%M:%S')
+
+
 # 随机延迟配置
 max_random_delay = int(os.getenv("MAX_RANDOM_DELAY", "600"))
 random_signin = os.getenv("RANDOM_SIGNIN", "true").lower() == "true"
@@ -123,7 +141,14 @@ class TianYiYunPan:
         self.password = password
         self.index = index
         self.session = requests.Session()
-        
+
+        # 通知明细用的字段
+        self.logged_in = False   # 登录是否成功
+        self.sign_at = None      # 签到接口返回的时刻
+        self.bonus_mb = 0        # 本次签到获得的空间（MB）
+        self.new_bonus_mb = 0    # 其中本次真正新增的部分（已签过的记 0）
+        self.already = False     # 今日此前是否已签到
+
     def int2char(self, a):
         return BI_RM[a]
 
@@ -301,6 +326,7 @@ class TianYiYunPan:
 
             if str(result.get("result")) == "0":
                 print(f"✅ 账号{self.index}: 登录成功")
+                self.logged_in = True
                 redirect_url = result.get("toUrl")
                 if redirect_url:
                     self.session.get(redirect_url, headers=headers, timeout=15)
@@ -334,7 +360,15 @@ class TianYiYunPan:
             
             netdiskBonus = result.get('netdiskBonus', 0)
             isSign = result.get('isSign', 'true')
-            
+
+            self.sign_at = time.time()
+            try:
+                self.bonus_mb = int(netdiskBonus or 0)
+            except (TypeError, ValueError):
+                self.bonus_mb = 0
+            self.already = str(isSign) != "false"
+            self.new_bonus_mb = 0 if self.already else self.bonus_mb
+
             if isSign == "false":
                 status_msg = f"✅ 签到成功，获得 {netdiskBonus}M 空间"
                 print(f"✅ 账号{self.index}: {status_msg}")
@@ -351,25 +385,43 @@ class TianYiYunPan:
 
     def main(self):
         """主执行函数"""
+        started = time.time()
         try:
             print(f"\n==== 账号{self.index} 开始执行 ====")
             print(f"🕐 开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             
             # 登录
             if not self.login():
-                error_msg = f"❌ 账号{self.index}: {self.username}\n登录失败，无法完成签到"
+                error_msg = (f"❌ 账号{self.index}: {self.username}\n"
+                             f"登录失败，无法完成签到\n"
+                             f"⏱️ 本次耗时: {fmt_elapsed(time.time() - started)}\n"
+                             f"🔑 凭证状态: 账号密码登录失败，请检查账号或密码")
                 print(error_msg)
                 return error_msg, False
             
             # 签到
             sign_result = self.sign_in()
-            
-            # 格式化结果
-            result_msg = f"""☁️ 天翼云盘签到结果
+            elapsed = time.time() - started
 
-👤 账号信息: {self.username}
-📊 签到状态: {sign_result}
-🕐 完成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"""
+            # 获得内容：签到接口直接返回本次空间奖励
+            if self.bonus_mb:
+                gain_text = (f"+{self.bonus_mb} MB"
+                             + ("（本次无新增）" if self.already else ""))
+            else:
+                gain_text = "无（接口返回 0 MB）"
+
+            sign_time = (f"🕐 签到时间: {fmt_clock(self.sign_at)}"
+                         if self.sign_at else
+                         f"🕐 完成时间: {fmt_clock()}")
+            status_text = "今日已签到" if self.already else ""
+
+            # 格式化结果（标题已体现成功/失败，这里不重复）
+            head = f"👤 账号: {self.username}"
+            if status_text:
+                head += f"（{status_text}）"
+            result_msg = f"""{head}
+🎁 今日获得: {gain_text}
+{sign_time}（耗时 {fmt_elapsed(elapsed)}）"""
 
             print(f"\n🎉 === 最终签到结果 ===")
             print(result_msg)
@@ -380,7 +432,8 @@ class TianYiYunPan:
             return result_msg, is_success
             
         except Exception as e:
-            error_msg = f"❌ 账号{self.index}: 执行异常 - {str(e)}"
+            error_msg = (f"❌ 账号{self.index}: 执行异常 - {str(e)}\n"
+                         f"⏱️ 本次耗时: {fmt_elapsed(time.time() - started)}")
             print(error_msg)
             return error_msg, False
 
@@ -458,7 +511,10 @@ def main():
     print(f"📝 共发现 {len(accounts)} 个账号")
 
     success_accounts = 0
+    already_count = 0
     all_results = []
+    total_bonus_mb = 0
+    run_start = time.time()
 
     for index, (username, password) in enumerate(accounts):
         try:
@@ -472,6 +528,9 @@ def main():
             tianyi = TianYiYunPan(username, password, index + 1)
             result_msg, is_success = tianyi.main()
             all_results.append(result_msg)
+            total_bonus_mb += tianyi.new_bonus_mb or 0
+            if tianyi.already:
+                already_count += 1
 
             if is_success:
                 success_accounts += 1
@@ -488,14 +547,11 @@ def main():
 
     # 发送汇总通知
     if len(accounts) > 1:
-        summary_msg = f"""☁️ 天翼云盘签到汇总
-
-📊 总计处理: {len(accounts)}个账号
-✅ 成功账号: {success_accounts}个
-❌ 失败账号: {len(accounts) - success_accounts}个
-📅 执行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-
-详细结果请查看各账号单独通知"""
+        extra_note = (f"（另有 {already_count} 个账号今日早前已签，未计入）"
+                      if already_count else "")
+        summary_msg = f"""📊 {len(accounts)} 个账号｜✅ {success_accounts}｜❌ {len(accounts) - success_accounts}
+🎁 本次新增: {total_bonus_mb} MB{extra_note}
+⏱️ 耗时: {fmt_elapsed(time.time() - run_start)}（{datetime.now().strftime('%H:%M:%S')} 完成）"""
         notify('天翼云盘签到汇总', summary_msg)
         print(f"\n📊 === 汇总统计 ===")
         print(summary_msg)

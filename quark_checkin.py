@@ -31,6 +31,7 @@ import sys
 import time
 import random
 import logging
+from datetime import datetime
 
 import requests
 
@@ -80,6 +81,24 @@ def notify(title, content, timeout=NOTIFY_TIMEOUT):
     return result["ok"]
 
 
+# ---------------- 通知内容辅助 ----------------
+def fmt_elapsed(seconds):
+    """把耗时秒数渲染成易读文本：1.2 秒 / 3 分 05 秒 / 1 小时 02 分 09 秒。"""
+    total = max(0.0, float(seconds or 0))
+    if total < 60:
+        return f"{total:.1f} 秒"
+    minutes, secs = divmod(int(round(total)), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours} 小时 {minutes:02d} 分 {secs:02d} 秒"
+    return f"{minutes} 分 {secs:02d} 秒"
+
+
+def fmt_clock(ts=None):
+    """时间戳渲染为 YYYY-MM-DD HH:MM:SS。"""
+    return datetime.fromtimestamp(ts if ts else time.time()).strftime('%Y-%m-%d %H:%M:%S')
+
+
 # ---------------- 日志 ----------------
 logging.basicConfig(
     level=logging.INFO,
@@ -126,6 +145,13 @@ class Quark:
         self.name = user_data.get('user') or f'账号{index + 1}'
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
+
+        # 通知明细用的字段（由 do_sign 填充）
+        self.sign_at = None          # 真正执行签到的时刻；已签到则为查询时刻
+        self.reward_bytes = 0        # 本次计入的容量（字节）
+        self.already_signed = False  # 今日此前是否已签
+        self.streak = ''             # 连签进度文本，如 5/30
+        self.total_capacity = 0      # 网盘总容量（字节）
 
     # ---------- 底层请求 ----------
     def _creds(self):
@@ -221,31 +247,58 @@ class Quark:
         cap_sign = growth_info.get('cap_sign') or {}
         cap_comp = growth_info.get('cap_composition') or {}
 
-        log = (f" {'88VIP' if growth_info.get('88VIP') else '普通用户'} {self.name}\n"
-               f"💾 网盘总容量：{convert_bytes(growth_info.get('total_capacity', 0))}，"
-               f"签到累计容量：")
-
-        if "sign_reward" in cap_comp:
-            log += f"{convert_bytes(cap_comp['sign_reward'])}\n"
-        else:
-            log += "0 MB\n"
+        sign_reward = cap_comp.get('sign_reward', 0) or 0
+        log = (f"{'88VIP' if growth_info.get('88VIP') else '普通用户'}｜"
+               f"总容量 {convert_bytes(growth_info.get('total_capacity', 0))}｜"
+               f"签到累计 {convert_bytes(sign_reward)}\n")
 
         progress = cap_sign.get('sign_progress', 0) or 0
         target = cap_sign.get('sign_target', 0) or 0
+        self.total_capacity = growth_info.get('total_capacity', 0) or 0
 
         if cap_sign.get("sign_daily"):
-            log += (f"✅ 签到日志: 今日已签到+"
-                    f"{convert_bytes(cap_sign.get('sign_daily_reward', 0))}，"
-                    f"连签进度({progress}/{target})\n")
+            self.already_signed = True
+            self.reward_bytes = cap_sign.get('sign_daily_reward', 0) or 0
+            self.streak = f"{progress}/{target}"
+            self.sign_at = time.time()
+            log += "✅ 今日已签到（此前完成）\n"
         else:
             ok, reward = self.get_growth_sign()
+            self.sign_at = time.time()
             if ok:
-                log += (f"✅ 执行签到: 今日签到+{convert_bytes(reward)}，"
-                        f"连签进度({progress + 1}/{target})\n")
+                self.reward_bytes = reward or 0
+                self.streak = f"{progress + 1}/{target}"
+                log += "✅ 签到完成\n"
             else:
+                self.reward_bytes = 0
                 log += f"❌ 签到异常: {reward}\n"
 
         return log
+
+    def notify_lines(self, elapsed):
+        """通知用明细：获得了什么 / 签到时间 / 耗时。"""
+        lines = []
+
+        if self.reward_bytes:
+            if self.already_signed:
+                what = f"本次无新增（今日早前已签 +{convert_bytes(self.reward_bytes)}）"
+            else:
+                what = f"+{convert_bytes(self.reward_bytes)}"
+                if self.streak:
+                    what += f"（连签 {self.streak}）"
+            lines.append(f"🎁 今日获得：{what}")
+        elif self.already_signed:
+            lines.append("🎁 今日获得：本次无新增（今日已签到）")
+        else:
+            lines.append("🎁 今日获得：无（签到未完成）")
+
+        if self.sign_at:
+            lines.append(f"🕐 签到时间：{fmt_clock(self.sign_at)}"
+                         f"（耗时 {fmt_elapsed(elapsed)}）")
+        else:
+            lines.append(f"🕐 完成时间：{fmt_clock()}（耗时 {fmt_elapsed(elapsed)}）")
+
+        return lines
 
 
 def split_accounts(raw):
@@ -341,16 +394,25 @@ def main():
         time.sleep(delay_seconds)
 
     msg = ''
+    run_start = time.time()
+    total_reward = 0
     for i, seg in enumerate(accounts):
         user_data = parse_account(seg)
         name = user_data.get('user') or f'账号{i + 1}'
         logger.info(f"🙍🏻‍♂️ 第{i + 1}个账号 {name}")
+        acc = Quark(user_data, i)
+        t0 = time.time()
         try:
-            log = Quark(user_data, i).do_sign()
+            log = acc.do_sign()
         except Exception as e:
             log = f"❌ {name}: 执行异常 {e}\n"
             logger.error(f"第{i + 1}个账号执行异常: {e}", exc_info=True)
-        msg += f"🙍🏻‍♂️ 第{i + 1}个账号\n{log}"
+        elapsed = time.time() - t0
+        if not acc.already_signed:
+            total_reward += acc.reward_bytes or 0
+
+        msg += f"🙍🏻‍♂️ 第{i + 1}个账号 {name}\n{log}"
+        msg += "\n".join(acc.notify_lines(elapsed)) + "\n"
         print(log)
 
         # 多账户间随机延迟，降低风控概率
@@ -358,6 +420,12 @@ def main():
             delay = random.uniform(10, 20)
             logger.info(f"⏳ 随机等待 {delay:.1f} 秒...")
             time.sleep(delay)
+
+    # 凭证只说一次，不逐账号重复
+    msg += "\n🔑 凭证：无到期字段，失效后重抓 QUARK_COOKIE"
+    msg += (f"\n📊 {len(accounts)} 个账号｜耗时 {fmt_elapsed(time.time() - run_start)}")
+    if total_reward:
+        msg += f"\n🎁 本次新签合计：+{convert_bytes(total_reward)}"
 
     notify('夸克自动签到', msg)
     return msg.strip()

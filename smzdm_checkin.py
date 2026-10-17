@@ -72,6 +72,40 @@ def notify(title, content, timeout=NOTIFY_TIMEOUT):
     t.join(timeout)
     return result["ok"]
 
+# ---------------- 通知内容辅助 ----------------
+def fmt_elapsed(seconds):
+    """把耗时秒数渲染成易读文本：1.2 秒 / 3 分 05 秒 / 1 小时 02 分 09 秒。"""
+    total = max(0.0, float(seconds or 0))
+    if total < 60:
+        return f"{total:.1f} 秒"
+    minutes, secs = divmod(int(round(total)), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours} 小时 {minutes:02d} 分 {secs:02d} 秒"
+    return f"{minutes} 分 {secs:02d} 秒"
+
+
+def fmt_clock(ts=None):
+    """时间戳渲染为 YYYY-MM-DD HH:MM:SS。"""
+    return datetime.fromtimestamp(ts if ts else time.time()).strftime('%Y-%m-%d %H:%M:%S')
+
+
+def to_int(value):
+    """把「1,234」这类展示值转成 int，失败返回 None。"""
+    try:
+        digits = re.sub(r'[^\d-]', '', str(value))
+        return int(digits) if digits else None
+    except (TypeError, ValueError):
+        return None
+
+
+def fmt_gain(before, after):
+    """返回 (最新余额, 差值)；取不到时返回 (None, None)。"""
+    b, a = to_int(before), to_int(after)
+    if b is None or a is None:
+        return None, None
+    return a, a - b
+
 # ---------------- 环境变量 ----------------
 # 随机延迟配置
 max_random_delay = int(os.getenv("MAX_RANDOM_DELAY", "600"))
@@ -226,9 +260,12 @@ class SmzdmAPI:
 
 
 # ==================== 用户信息（H5） ====================
-def get_user_info(cookie):
+def get_user_info(cookie, quiet=False):
+    def _p(msg):
+        if not quiet:
+            print(msg)
     try:
-        print("👤 正在获取用户信息...")
+        _p("👤 正在获取用户信息...")
         headers = {
             'Host': 'zhiyou.smzdm.com',
             'Accept': '*/*',
@@ -253,8 +290,8 @@ def get_user_info(cookie):
         gold = gold_match.group(1).strip() if gold_match else "0"
         silver = silver_match.group(1).strip() if silver_match else "0"
 
-        print(f"👤 用户: {name} (VIP{level})")
-        print(f"💰 金币: {gold}, 🪙 碎银: {silver}")
+        _p(f"👤 用户: {name} (VIP{level})")
+        _p(f"💰 金币: {gold}, 🪙 碎银: {silver}")
         return name, level, gold, silver
     except Exception as e:
         print(f"❌ 获取用户信息失败: {e}")
@@ -306,6 +343,7 @@ def smzdm_signin(cookie, index):
     """
     print(f"\n==== 开始第{index}个帐号签到 ====")
 
+    started = time.time()
     try:
         name, level, gold, silver = get_user_info(cookie)
 
@@ -313,42 +351,70 @@ def smzdm_signin(cookie, index):
         try:
             print("🎯 正在执行签到...")
             ok, signin_msg, checkin_data = api.daily_checkin()
+            sign_at = time.time()
             print(f"🎯 签到状态: {signin_msg}")
 
             continuous_days = 0
             if checkin_data:
                 continuous_days = checkin_data.get('continue_checkin_days', 0) or 0
 
+            # 签到后再取一次资产，用差值给出「今天获得了什么」
+            _, _, gold_after, silver_after = get_user_info(cookie, quiet=True)
+            gold_now, gold_diff = fmt_gain(gold, gold_after)
+            silver_now, silver_diff = fmt_gain(silver, silver_after)
+
+            gains = []
+            if gold_diff:
+                gains.append(f"金币 {gold_diff:+d}")
+            if silver_diff:
+                gains.append(f"碎银 {silver_diff:+d}")
+            if gains:
+                gain_text = '、'.join(gains)
+            elif ok:
+                gain_text = signin_msg
+            else:
+                gain_text = "无（签到未成功）"
+
             monthly_exp = get_monthly_exp(cookie)
 
+            gold_line = f"💰 金币: {gold_now if gold_now is not None else gold}"
+            if gold_diff:
+                gold_line += f"（{gold_diff:+d}）"
+            silver_line = f"🪙 碎银: {silver_now if silver_now is not None else silver}"
+            if silver_diff:
+                silver_line += f"（{silver_diff:+d}）"
+
             final_msg = (
-                f"什么值得买签到结果\n\n"
-                f"👤 账号: 第{index}个账号 ({name})\n"
-                f"⭐ 等级: VIP{level}\n"
-                f"💰 金币: {gold}\n"
-                f"🪙 碎银: {silver}\n"
-                f"📊 本月经验: {monthly_exp}\n\n"
-                f"🎯 签到状态: {signin_msg}"
-                + (f"\n📅 连续签到: {continuous_days} 天" if continuous_days else "")
-                + f"\n\n🕐 签到时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                f"👤 第{index}个账号 {name}｜VIP{level}\n"
+                f"{gold_line}｜{silver_line}\n"
+                f"📊 本月经验: {monthly_exp}\n"
+                f"🎁 今日获得: {gain_text}"
+                + (f"｜连签 {continuous_days} 天" if continuous_days else "")
+                + (f"\n🕐 签到时间: {fmt_clock(sign_at)}" if ok
+                   else f"\n🕐 完成时间: {fmt_clock(sign_at)}")
+                + f"｜耗时 {fmt_elapsed(time.time() - started)}"
             )
 
             print(f"{'✅ 签到成功' if ok else '❌ 签到失败'}")
+            print(final_msg)
             return final_msg, ok
 
         finally:
             api.close()
 
     except requests.exceptions.Timeout:
-        error_msg = f"❌ 账号{index}: 请求超时，网络连接可能有问题"
+        error_msg = (f"❌ 账号{index}: 请求超时，网络连接可能有问题\n"
+                     f"⏱️ 本次耗时: {fmt_elapsed(time.time() - started)}")
         print(error_msg)
         return error_msg, False
     except requests.exceptions.ConnectionError:
-        error_msg = f"❌ 账号{index}: 网络连接错误，无法连接到服务器"
+        error_msg = (f"❌ 账号{index}: 网络连接错误，无法连接到服务器\n"
+                     f"⏱️ 本次耗时: {fmt_elapsed(time.time() - started)}")
         print(error_msg)
         return error_msg, False
     except Exception as e:
-        error_msg = f"❌ 账号{index}: 签到异常 - {str(e)}"
+        error_msg = (f"❌ 账号{index}: 签到异常 - {str(e)}\n"
+                     f"⏱️ 本次耗时: {fmt_elapsed(time.time() - started)}")
         print(error_msg)
         return error_msg, False
 
@@ -373,11 +439,18 @@ def main():
 
     cookies = [c.strip() for c in SMZDM_COOKIE_env.replace('\r\n', '\n').split('\n')
                if c.strip()]
+    if not cookies:
+        # 全是空白字符时不能静默成功（0==0 会返回 0）
+        error_msg = "❌ SMZDM_COOKIE 为空或格式无效，请检查环境变量"
+        print(error_msg)
+        notify("什么值得买签到失败", error_msg)
+        return 2
     print(f"📝 共发现 {len(cookies)} 个账号")
 
     success_count = 0
     total_count = len(cookies)
     detail_lines = []
+    run_start = time.time()
 
     for i, cookie in enumerate(cookies):
         try:
@@ -403,13 +476,10 @@ def main():
 
     if total_count > 1:
         summary_msg = (
-            f"什么值得买签到汇总\n\n"
-            f"📊 总计处理: {total_count}个账号\n"
-            f"✅ 签到成功: {success_count}个账号\n"
-            f"❌ 签到失败: {total_count - success_count}个账号\n"
-            f"📈 成功率: {success_count / total_count * 100:.1f}%\n"
+            f"📊 {total_count} 个账号｜✅ {success_count}｜"
+            f"❌ {total_count - success_count}\n"
             + "\n".join(detail_lines)
-            + f"\n🕐 完成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            + f"\n⏱️ 耗时 {fmt_elapsed(time.time() - run_start)}"
         )
         notify("什么值得买签到汇总", summary_msg)
 

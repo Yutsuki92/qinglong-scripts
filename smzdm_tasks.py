@@ -75,6 +75,57 @@ def notify(title, content, timeout=NOTIFY_TIMEOUT):
     t.join(timeout)
     return result["ok"]
 
+# ---------------- 通知内容辅助 ----------------
+def fmt_elapsed(seconds):
+    """把耗时秒数渲染成易读文本：1.2 秒 / 3 分 05 秒 / 1 小时 02 分 09 秒。"""
+    total = max(0.0, float(seconds or 0))
+    if total < 60:
+        return f"{total:.1f} 秒"
+    minutes, secs = divmod(int(round(total)), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours} 小时 {minutes:02d} 分 {secs:02d} 秒"
+    return f"{minutes} 分 {secs:02d} 秒"
+
+
+def fmt_clock(ts=None):
+    """时间戳渲染为 YYYY-MM-DD HH:MM:SS。"""
+    return datetime.fromtimestamp(ts if ts else time.time()).strftime('%Y-%m-%d %H:%M:%S')
+
+
+def to_int(value, default=0):
+    """把接口里可能是 str/int/None 的数值统一成 int。"""
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def new_stats():
+    """模块统计的统一结构。
+
+    fatal 非空表示该模块整体失败（拿不到活动/任务列表、异常中断），
+    调用方据此判定账号是否失败，不能只看统计是否为 0。
+    claimed_ids / claimed_rewards 记录「执行阶段已领掉的奖励」，
+    避免收尾再领一次，也避免通知里把这些奖励漏掉。
+    """
+    return {
+        'success': 0, 'fail': 0, 'skip': 0,
+        'reward': None,
+        'fatal': '',          # 模块整体失败（请求异常/异常中断）→ 账号判失败
+        'unavailable': '',    # 今日没有该模块的活动 → 正常情况，不算失败
+        'claimed_ids': set(),
+        'claimed_rewards': [],
+        'stage_reward': None,   # 活动阶段性奖励：None=无 / True=已领 / False=领取失败
+    }
+
+
+def task_reward_text(task):
+    """从任务的 task_reward_data 里拼出奖励名称，如「5金币」。"""
+    data = task.get('task_reward_data') or []
+    parts = [f"{r.get('name', '')}{r.get('num', '')}" for r in data if isinstance(r, dict)]
+    return ', '.join(p for p in parts if p.strip())
+
 # ---------------- 环境变量 ----------------
 # 随机延迟配置
 max_random_delay = int(os.getenv("MAX_RANDOM_DELAY", "600"))
@@ -228,12 +279,16 @@ class SmzdmAPI:
 
     # ---------- 众测任务 ----------
     def get_activity_id(self, from_source='zhongce'):
+        """返回活动 ID：None=请求失败，''=请求成功但当前没有活动，其余为 ID。"""
         url = f'{BASE_URL}/task/task/ajax_get_activity_id'
         data = self._request('GET', url, params={'from': from_source})
-        if data and isinstance(data.get('data'), dict):
+        if data is None:
+            return None
+        if isinstance(data.get('data'), dict):
             aid = data['data'].get('activity_id')
-            return str(aid) if aid else None
-        return None
+            if aid:
+                return str(aid)
+        return ''
 
     def get_activity_info(self, activity_id):
         url = f'{BASE_URL}/task/task/ajax_get_activity_info'
@@ -448,14 +503,15 @@ class SmzdmService:
     def execute_task(self, task):
         """
         按 task_event_type 分派众测任务
-        Returns: True 表示已处理（成功/无需处理），False 表示失败
+        Returns: True=已处理, False=失败, None=类型不支持（跳过，不计成功）
         """
         event_type = task.get('task_event_type', '')
         task_id = task.get('task_id', '')
 
-        # 已完成但未领取：直接领奖，不要落到兜底分支
-        if int(task.get('task_status', 0) or 0) == 3:
-            return self.api.receive_reward(task_id)
+        # 已完成待领取：领奖由调用方统一执行并记账（见 process_zhongce_tasks），
+        # 这里只标记为跳过，避免同一 task_id 被领两次。
+        if to_int(task.get('task_status')) == 3:
+            return None
 
         # 真机里 article_id/channel_id 常为 0，需从 task_redirect_url 兜底解析
         article_id, channel_id = self._resolve_article_ref(task)
@@ -481,7 +537,7 @@ class SmzdmService:
             return self.apply_zhongce_task(task)
 
         logger.info(f"    ℹ️  未支持的众测任务类型 [{event_type}]，跳过")
-        return True
+        return None
 
     def apply_zhongce_task(self, task):
         """申请众测（按剩余次数批量申请）"""
@@ -680,21 +736,31 @@ class SmzdmTaskManager:
         logger.info(f"\n{'='*60}")
         logger.info("🎯 开始处理众测任务模块")
         logger.info(f"{'='*60}")
-        stats = {'success': 0, 'fail': 0, 'skip': 0}
+        stats = new_stats()
         try:
             energy = self.api.get_user_energy_info()
             if energy:
                 self.service.print_energy_info(energy)
 
             activity_id = self.api.get_activity_id()
+            if activity_id is None:
+                logger.error("❌ 获取众测活动ID失败（请求异常）")
+                stats['fatal'] = '获取众测活动ID失败'
+                return stats
             if not activity_id:
-                logger.error("❌ 获取众测活动ID失败")
+                # 请求成功但没有活动 ID：当期活动未上线或已结束，属正常情况
+                logger.info("ℹ️  今日没有可参与的众测活动")
+                stats['unavailable'] = '今日无众测活动'
                 return stats
             logger.info(f"✅ 活动ID: {activity_id}")
 
             tasks = self.api.get_task_list(activity_id)
-            if not tasks:
+            if tasks is None:
                 logger.error("❌ 获取众测任务列表失败")
+                stats['fatal'] = '获取众测任务列表失败'
+                return stats
+            if not tasks:
+                logger.info("ℹ️  今日没有众测任务")
                 return stats
 
             logger.info(f"📊 众测任务列表 (共 {len(tasks)} 个):")
@@ -704,11 +770,36 @@ class SmzdmTaskManager:
             logger.info("🔧 开始执行众测任务...")
             for task in tasks:
                 task_name = task.get('task_name', '未知任务')
-                if task.get('task_status', 0) == 4:
+                task_id = task.get('task_id', '')
+                task_status = to_int(task.get('task_status'))
+                if task_status == 4:
                     stats['skip'] += 1
                     continue
+                # 已完成待领取：当场领掉并记录奖励名，交给收尾领取会因状态
+                # 变成 4 而查不到，导致「今日获得」被误报为「没有奖励」。
+                if task_status == 3:
+                    reward_text = task_reward_text(task)
+                    logger.info(f"  💰 任务 [{task_name}] 已完成，尝试领取奖励...")
+                    try:
+                        if self.api.receive_reward(task_id):
+                            stats['success'] += 1
+                            if task_id:
+                                stats['claimed_ids'].add(str(task_id))
+                            stats['claimed_rewards'].append(reward_text or task_name)
+                            logger.info(f"    ✅ 奖励领取成功: {reward_text}")
+                        else:
+                            stats['fail'] += 1
+                            logger.warning(f"    ❌ [{task_name}] 奖励领取失败")
+                    except Exception as e:
+                        stats['fail'] += 1
+                        logger.error(f"    ❌ 领取 [{task_name}] 奖励异常: {e}")
+                    time.sleep(1)
+                    continue
                 try:
-                    if self.service.execute_task(task):
+                    result = self.service.execute_task(task)
+                    if result is None:
+                        stats['skip'] += 1
+                    elif result:
                         stats['success'] += 1
                     else:
                         stats['fail'] += 1
@@ -726,10 +817,11 @@ class SmzdmTaskManager:
             logger.info(f"    ⏭️  跳过: {stats['skip']} 个")
 
             logger.info("💰 检查并领取众测任务奖励...")
-            self.claim_task_rewards(activity_id)
+            stats['reward'] = self.claim_task_rewards(activity_id, stats['claimed_ids'])
             return stats
         except Exception as e:
             logger.error(f"❌ 处理众测任务时发生错误: {e}", exc_info=True)
+            stats['fatal'] = f'众测模块异常: {e}'
             return stats
 
     def print_task_info(self, task):
@@ -753,48 +845,64 @@ class SmzdmTaskManager:
         logger.info(f"    📋 {task_name}: {status_text} ({task_finished}/{task_total})"
                     + (f" 🎁 {reward_text}" if reward_text else ""))
 
-    def claim_task_rewards(self, activity_id):
+    def claim_task_rewards(self, activity_id, exclude_ids=None):
+        """领取众测任务奖励，返回 {'claimed','failed','rewards','ok'}。
+
+        ok=False 表示没能取到任务列表，无法判断是否有奖励，
+        不能据此输出「没有可领取的奖励」。
+        exclude_ids 是本轮执行阶段已经领掉的 task_id，用于避免重复领取。
+        """
+        claim = {'claimed': 0, 'failed': 0, 'rewards': [], 'ok': True}
+        exclude_ids = exclude_ids or set()
         try:
             tasks = self.api.get_task_list(activity_id)
-            if not tasks:
+            if tasks is None:
                 logger.warning("    ⚠️  重新获取任务列表失败，无法领取奖励")
-                return
-            claimable = [t for t in tasks if t.get('task_status') == 3]
+                claim['ok'] = False
+                return claim
+            if not tasks:
+                logger.info("    ℹ️  今日没有众测任务")
+                return claim
+            claimable = [t for t in tasks
+                         if to_int(t.get('task_status')) == 3
+                         and str(t.get('task_id')) not in exclude_ids]
             if not claimable:
                 logger.info("    ℹ️  没有可领取的任务奖励")
-                return
+                return claim
             logger.info(f"    🎁 发现 {len(claimable)} 个可领取奖励的任务")
             claimed = failed = 0
             for task in claimable:
                 task_id = task.get('task_id', '')
                 task_name = task.get('task_name', '未知任务')
-                reward_text = ""
-                if task.get('task_reward_data'):
-                    reward_text = ', '.join(
-                        f"{r.get('name', '')}{r.get('num', '')}"
-                        for r in task['task_reward_data']
-                    )
+                reward_text = task_reward_text(task)
                 if self.api.receive_reward(task_id):
                     claimed += 1
                     logger.info(f"      ✅ [{task_name}] 奖励领取成功: {reward_text}")
+                    claim['rewards'].append(reward_text or task_name)
                 else:
                     failed += 1
+                    logger.warning(f"      ❌ [{task_name}] 奖励领取失败")
                 time.sleep(1)
             if claimed or failed:
                 logger.info(f"  📊 奖励领取结果: 成功 {claimed} 个, 失败 {failed} 个")
+            claim.update({'claimed': claimed, 'failed': failed})
+            return claim
         except Exception as e:
             logger.error(f"    ❌ 领取奖励过程中发生错误: {e}")
+            claim['ok'] = False
+            return claim
 
     # ---------- 互动 ----------
     def process_interactive_tasks(self):
         logger.info(f"\n{'='*60}")
         logger.info("🎯 开始处理互动任务模块")
         logger.info(f"{'='*60}")
-        stats = {'success': 0, 'fail': 0, 'skip': 0}
+        stats = new_stats()
         try:
             task_data = self.api.get_interactive_task_list()
             if task_data is None:
                 logger.error("❌ 获取互动任务列表失败")
+                stats['fatal'] = '获取互动任务列表失败'
                 return stats
 
             rows = task_data.get('rows', [])
@@ -806,9 +914,11 @@ class SmzdmTaskManager:
                     logger.info("🎁 检测到活动阶段性奖励可领取...")
                     robot_token = self.api.get_robot_token()
                     if robot_token and self.api.activity_task_receive(activity_id, robot_token):
+                        stats['stage_reward'] = True
                         logger.info("    ✅ 活动阶段性奖励领取成功")
                     else:
-                        logger.info("    ❌ 活动阶段性奖励领取失败")
+                        stats['stage_reward'] = False
+                        logger.warning("    ❌ 活动阶段性奖励领取失败")
 
             tasks = self.service.parse_interactive_tasks(task_data)
             if not tasks:
@@ -821,7 +931,7 @@ class SmzdmTaskManager:
             for task in tasks:
                 task_id = task.get('task_id', '')
                 task_name = task.get('task_name', '未知任务')
-                task_status = int(task.get('task_status', '0') or 0)
+                task_status = to_int(task.get('task_status'))
                 event_type = task.get('task_event_type', '')
 
                 if task_status == 4:
@@ -830,13 +940,17 @@ class SmzdmTaskManager:
                     continue
 
                 if task_status == 3:
+                    reward_text = task_reward_text(task)
                     logger.info(f"  💰 任务 [{task_name}] 已完成,尝试领取奖励...")
                     try:
                         if self.api.receive_reward(task_id):
-                            logger.info(f"    ✅ 任务 [{task_name}] 奖励领取成功")
+                            logger.info(f"    ✅ 任务 [{task_name}] 奖励领取成功: {reward_text}")
                             stats['success'] += 1
+                            if task_id:
+                                stats['claimed_ids'].add(str(task_id))
+                            stats['claimed_rewards'].append(reward_text or task_name)
                         else:
-                            logger.info(f"    ❌ 任务 [{task_name}] 奖励领取失败")
+                            logger.warning(f"    ❌ 任务 [{task_name}] 奖励领取失败")
                             stats['fail'] += 1
                     except Exception as e:
                         logger.error(f"    ❌ 领取任务 [{task_name}] 奖励异常: {e}")
@@ -907,42 +1021,59 @@ class SmzdmTaskManager:
             logger.info(f"    ⏭️  跳过: {stats['skip']} 个")
 
             logger.info("💰 重新获取互动任务状态并领取奖励...")
-            self.claim_interactive_task_rewards()
+            stats['reward'] = self.claim_interactive_task_rewards(stats['claimed_ids'])
             return stats
         except Exception as e:
             logger.error(f"❌ 处理互动任务时发生错误: {e}", exc_info=True)
+            stats['fatal'] = f'互动模块异常: {e}'
             return stats
 
-    def claim_interactive_task_rewards(self):
+    def claim_interactive_task_rewards(self, exclude_ids=None):
+        """领取互动任务奖励，返回 {'claimed','failed','rewards','ok'}。
+
+        ok=False 表示没能取到任务列表，无法判断是否有奖励。
+        exclude_ids 为本轮执行阶段已领掉的 task_id，避免重复领取。
+        """
+        claim = {'claimed': 0, 'failed': 0, 'rewards': [], 'ok': True}
+        exclude_ids = exclude_ids or set()
         try:
             task_data = self.api.get_interactive_task_list()
             if task_data is None:
                 logger.warning("    ⚠️  重新获取互动任务列表失败，无法领取奖励")
-                return
+                claim['ok'] = False
+                return claim
             tasks = self.service.parse_interactive_tasks(task_data)
             if not tasks:
                 logger.info("    ℹ️  当前没有互动任务")
-                return
-            claimable = [t for t in tasks if str(t.get('task_status')) == '3']
+                return claim
+            claimable = [t for t in tasks
+                         if to_int(t.get('task_status')) == 3
+                         and str(t.get('task_id')) not in exclude_ids]
             if not claimable:
                 logger.info("    ℹ️  没有可领取的互动任务奖励")
-                return
+                return claim
             logger.info(f"    🎁 发现 {len(claimable)} 个可领取奖励的互动任务")
             claimed = failed = 0
             for task in claimable:
                 task_id = task.get('task_id', '')
                 task_name = task.get('task_name', '未知任务')
+                reward_text = task_reward_text(task)
                 if self.api.receive_reward(task_id):
                     claimed += 1
-                    logger.info(f"      ✅ [{task_name}] 奖励领取成功")
+                    logger.info(f"      ✅ [{task_name}] 奖励领取成功: {reward_text}")
+                    claim['rewards'].append(reward_text or task_name)
                 else:
                     failed += 1
-                    logger.info(f"      ❌ [{task_name}] 奖励领取失败")
+                    logger.warning(f"      ❌ [{task_name}] 奖励领取失败")
                 time.sleep(1)
             if claimed or failed:
                 logger.info(f"  📊 互动任务奖励领取结果: 成功 {claimed} 个, 失败 {failed} 个")
+            claim.update({'claimed': claimed, 'failed': failed})
+            return claim
         except Exception as e:
             logger.error(f"    ❌ 领取互动任务奖励过程中发生错误: {e}")
+            claim['ok'] = False
+            return claim
 
 
 # ==================== 单账号活动流程 ====================
@@ -953,6 +1084,7 @@ def run_account_tasks(cookie, index):
     """
     print(f"\n==== 开始第{index}个帐号活动任务 ====")
     stats = {'zhongce': None, 'interactive': None}
+    started = time.time()
 
     try:
         api = SmzdmAPI(cookie)
@@ -974,39 +1106,91 @@ def run_account_tasks(cookie, index):
                 stats['interactive'] = manager.process_interactive_tasks()
 
             # 组装消息
-            lines = [f"什么值得买活动任务结果", "",
-                     f"👤 账号: 第{index}个账号"]
-            if stats['zhongce']:
-                z = stats['zhongce']
-                lines.append(f"🎯 众测任务: ✅{z['success']} ⚠️{z['fail']} ⏭️{z['skip']}")
-            if stats['interactive']:
-                i = stats['interactive']
-                lines.append(f"🎯 互动任务: ✅{i['success']} ⚠️{i['fail']} ⏭️{i['skip']}")
-            if not stats['zhongce'] and not stats['interactive']:
+            lines = [f"👤 第{index}个账号"]
+            modules = [('众测任务', stats['zhongce']), ('互动任务', stats['interactive'])]
+            for label, m in modules:
+                if not m:
+                    continue
+                if m.get('fatal'):
+                    lines.append(f"❌ {label}: 模块失败（{m['fatal']}）")
+                elif m.get('unavailable'):
+                    lines.append(f"ℹ️ {label}: {m['unavailable']}")
+                elif m.get('success') or m.get('fail') or m.get('skip'):
+                    lines.append(f"🎯 {label}: ✅{m.get('success', 0)} "
+                                 f"⚠️{m.get('fail', 0)} ⏭️{m.get('skip', 0)}")
+                else:
+                    lines.append(f"🎯 {label}: 今日无任务")
+            if not any(m for _, m in modules):
                 lines.append("⚠️  未执行任何任务模块")
+
+            # 今日获得 = 执行阶段当场领到的 + 收尾统一领到的
+            claimed_names, claimed_count, failed_count = [], 0, 0
+            stage_reward, claim_unknown = None, False
+            for _, m in modules:
+                if not m:
+                    continue
+                exec_rewards = m.get('claimed_rewards') or []
+                claimed_names += exec_rewards
+                claimed_count += len(exec_rewards)
+                if m.get('stage_reward') is not None:
+                    stage_reward = m.get('stage_reward')
+                reward = m.get('reward')
+                if reward:
+                    claimed_count += reward.get('claimed', 0)
+                    failed_count += reward.get('failed', 0)
+                    claimed_names += reward.get('rewards') or []
+                    if not reward.get('ok', True):
+                        claim_unknown = True
+
+            if stage_reward is True:
+                lines.append("🎁 阶段性奖励: 已领取")
+            elif stage_reward is False:
+                lines.append("🎁 阶段性奖励: 领取失败")
+
+            names = list(dict.fromkeys(n for n in claimed_names if n))
+            if claimed_count or names:
+                total = claimed_count or len(names)
+                if names:
+                    shown = '、'.join(names[:5])
+                    more = f" 等 {total} 项" if total > 5 else ""
+                    lines.append(f"🎁 今日获得: {shown}{more}")
+                else:
+                    lines.append(f"🎁 今日获得: 已领取 {total} 项（接口未返回名称）")
+            elif claim_unknown:
+                lines.append("🎁 今日获得: 未知（任务列表获取失败）")
+            elif failed_count:
+                lines.append(f"🎁 今日获得: 无（{failed_count} 项领取失败）")
+            else:
+                lines.append("🎁 今日获得: 无")
+
             lines.append("")
-            lines.append(f"🕐 完成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            lines.append(f"🕐 完成时间: {fmt_clock()}｜耗时 {fmt_elapsed(time.time() - started)}")
 
             msg = "\n".join(lines)
-            ok = True
-            if stats['zhongce'] is None and stats['interactive'] is None:
-                ok = False
+            # 只要有模块整体失败（fatal），账号就判失败：
+            # 否则「Cookie 失效 / 活动 ID 拿不到」会被一句「活动完成」盖住。
+            ran = [m for _, m in modules if m]
+            ok = bool(ran) and not any(m.get('fatal') for m in ran)
             print(f"{'✅ 活动任务完成' if ok else '❌ 活动任务失败'}")
+            print(msg)
             return msg, ok, stats
 
         finally:
             api.close()
 
     except requests.exceptions.Timeout:
-        error_msg = f"❌ 账号{index}: 请求超时，网络连接可能有问题"
+        error_msg = (f"❌ 账号{index}: 请求超时，网络连接可能有问题\n"
+                     f"⏱️ 耗时 {fmt_elapsed(time.time() - started)}")
         print(error_msg)
         return error_msg, False, stats
     except requests.exceptions.ConnectionError:
-        error_msg = f"❌ 账号{index}: 网络连接错误，无法连接到服务器"
+        error_msg = (f"❌ 账号{index}: 网络连接错误，无法连接到服务器\n"
+                     f"⏱️ 耗时 {fmt_elapsed(time.time() - started)}")
         print(error_msg)
         return error_msg, False, stats
     except Exception as e:
-        error_msg = f"❌ 账号{index}: 活动任务异常 - {str(e)}"
+        error_msg = (f"❌ 账号{index}: 活动任务异常 - {str(e)}\n"
+                     f"⏱️ 耗时 {fmt_elapsed(time.time() - started)}")
         print(error_msg)
         return error_msg, False, stats
 
@@ -1032,11 +1216,18 @@ def main():
 
     cookies = [c.strip() for c in SMZDM_COOKIE_env.replace('\r\n', '\n').split('\n')
                if c.strip()]
+    if not cookies:
+        # 全是空白字符时不能静默成功（0==0 会返回 0）
+        error_msg = "❌ SMZDM_COOKIE 为空或格式无效，请检查环境变量"
+        print(error_msg)
+        notify("什么值得买活动任务失败", error_msg)
+        return 2
     print(f"📝 共发现 {len(cookies)} 个账号")
 
     success_count = 0
     total_count = len(cookies)
     detail_lines = []
+    run_start = time.time()
 
     for i, cookie in enumerate(cookies):
         try:
@@ -1062,12 +1253,10 @@ def main():
 
     if total_count > 1:
         summary_msg = (
-            f"什么值得买活动任务汇总\n\n"
-            f"📊 总计处理: {total_count}个账号\n"
-            f"✅ 成功: {success_count}个账号\n"
-            f"❌ 失败: {total_count - success_count}个账号\n"
+            f"📊 {total_count} 个账号｜✅ {success_count}｜"
+            f"❌ {total_count - success_count}\n"
             + "\n".join(detail_lines)
-            + f"\n🕐 完成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            + f"\n⏱️ 耗时 {fmt_elapsed(time.time() - run_start)}"
         )
         notify("什么值得买活动任务汇总", summary_msg)
 

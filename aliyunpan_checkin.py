@@ -17,6 +17,7 @@ new Env('阿里云盘签到')
 
 import json
 import os
+import sys
 import requests
 import urllib3
 import random
@@ -72,6 +73,37 @@ def notify(title, content, timeout=NOTIFY_TIMEOUT):
     t.start()
     t.join(timeout)
     return result["ok"]
+
+# ---------------- 通知内容辅助 ----------------
+def fmt_elapsed(seconds):
+    """把耗时秒数渲染成易读文本：1.2 秒 / 3 分 05 秒 / 1 小时 02 分 09 秒。"""
+    total = max(0.0, float(seconds or 0))
+    if total < 60:
+        return f"{total:.1f} 秒"
+    minutes, secs = divmod(int(round(total)), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours} 小时 {minutes:02d} 分 {secs:02d} 秒"
+    return f"{minutes} 分 {secs:02d} 秒"
+
+
+def fmt_clock(ts=None):
+    """时间戳渲染为 YYYY-MM-DD HH:MM:SS。"""
+    return datetime.fromtimestamp(ts if ts else time.time()).strftime('%Y-%m-%d %H:%M:%S')
+
+
+def fmt_seconds_span(seconds):
+    """把「有效秒数」渲染成 2.0 小时 / 30.0 天。"""
+    try:
+        n = float(seconds)
+    except (TypeError, ValueError):
+        return ""
+    if n <= 0:
+        return ""
+    for unit, secs in (("天", 86400), ("小时", 3600), ("分钟", 60)):
+        if n >= secs:
+            return f"{n / secs:.1f} {unit}"
+    return f"{int(n)} 秒"
 
 # 随机延迟配置
 max_random_delay = int(os.getenv("MAX_RANDOM_DELAY", "600"))
@@ -564,8 +596,10 @@ def update_local_env(var_name, new_value):
                     new_lines = []
                     
                     for line in lines:
-                        if line.strip().startswith(f'{var_name}='):
-                            new_lines.append(f'{var_name}={new_value}\n')
+                        stripped = line.strip()
+                        prefix = 'export ' if stripped.startswith('export ') else ''
+                        if stripped[len(prefix):].startswith(f'{var_name}='):
+                            new_lines.append(f'{prefix}{var_name}={new_value}\n')
                             updated = True
                         else:
                             new_lines.append(line)
@@ -584,8 +618,11 @@ def update_local_env(var_name, new_value):
                     print(f"⚠️ 更新 {env_file} 失败: {e}")
                     continue
         
-        print("💡 未找到 .env 文件，仅更新了当前进程环境变量")
-        return True
+        # 只改了当前进程，进程退出即失效：不能当成功汇报，
+        # 否则通知写「已自动写回」而下次运行仍用旧 token。
+        print("⚠️ 未找到 .env 文件，仅更新了当前进程环境变量（重启后失效），"
+              "请在面板里手动更新")
+        return False
         
     except Exception as e:
         print(f"⚠️ 本地环境处理失败: {e}")
@@ -599,6 +636,12 @@ class AliYun:
         self.index = index
         self.new_refresh_token = None
         self.account_id = generate_account_id(refresh_token)
+
+        # 通知明细用的字段
+        self.signed_at = None      # 签到成功时刻
+        self.token_meta = {}       # access/refresh token 有效期信息
+        self.reward_info = ""      # 今日奖励描述
+        self.token_update_ok = None  # 写回结果：None=未尝试 / True=成功 / False=失败
 
     def update_token(self):
         """更新访问令牌"""
@@ -642,7 +685,14 @@ class AliYun:
                 
             access_token = result.get("access_token")
             new_refresh_token = result.get("refresh_token")
-            
+
+            # 记录有效期信息，供通知展示（服务端未返回时留空）
+            self.token_meta = {
+                "issued_at": time.time(),
+                "access_expires_in": result.get("expires_in"),
+                "refresh_expires_in": result.get("refresh_token_expires_in"),
+            }
+
             if access_token:
                 print("✅ 访问令牌更新成功")
                 
@@ -659,7 +709,8 @@ class AliYun:
                     if auto_update_token:
                         print("🤖 正在尝试自动更新环境变量...")
                         success = update_environment_variable("ALIYUN_REFRESH_TOKEN", new_refresh_token, self.refresh_token)
-                        
+                        self.token_update_ok = bool(success)
+
                         if success:
                             print("✅ 环境变量自动更新成功")
                             # 更新当前实例的token
@@ -803,6 +854,8 @@ class AliYun:
                 reward_info = "首次签到完成" if sign_days == 1 else "签到完成"
 
             print(f"✅ 签到成功，累计{sign_days}天")
+            self.signed_at = time.time()
+            self.reward_info = reward_info
             return f"签到成功，累计{sign_days}天", True, reward_info
 
         except requests.exceptions.Timeout:
@@ -923,27 +976,28 @@ class AliYun:
             return f"{desc}（无额外奖励）"
         return desc
 
+    def token_lines(self):
+        """凭证有效期行：仅在有实际时长时输出，避免冗长说明。"""
+        meta = self.token_meta or {}
+        access_span = fmt_seconds_span(meta.get("access_expires_in"))
+        refresh_span = fmt_seconds_span(meta.get("refresh_expires_in"))
+        parts = []
+        if access_span:
+            parts.append(f"access {access_span}（自动刷新）")
+        parts.append(f"refresh {refresh_span}" if refresh_span else "refresh 长期有效")
+        return ["🔑 " + "｜".join(parts)]
+
     def main(self):
         """主执行函数"""
+        started = time.time()
         print(f"\n==== 账号{self.index} 开始签到 ====")
         
         # 1. 更新Token
         access_token, error_msg = self.update_token()
         if not access_token:
-            full_error_msg = f"""Token更新失败
-
-❌ 错误原因: {error_msg}
-
-🔧 解决方法:
-1. 打开阿里云盘网页版: https://www.aliyundrive.com/
-2. 登录您的账号
-3. 按F12打开开发者工具
-4. 切换到Application标签页
-5. 在左侧找到Local Storage → https://www.aliyundrive.com
-6. 找到token项，复制refresh_token的值
-7. 更新环境变量ALIYUN_REFRESH_TOKEN
-
-💡 提示: refresh_token通常以字母开头，长度较长"""
+            full_error_msg = f"""❌ Token 已失效: {error_msg}
+⏱️ 耗时: {fmt_elapsed(time.time() - started)}
+🔧 重新抓取: 网页版登录 https://www.aliyundrive.com → F12 → Application → Local Storage → 复制 refresh_token → 更新 ALIYUN_REFRESH_TOKEN"""
             
             print(f"❌ {full_error_msg}")
             return full_error_msg, False
@@ -953,11 +1007,10 @@ class AliYun:
 
         # 3. 执行签到（含领取奖励）
         sign_msg, is_success, reward_info = self.sign(access_token)
+        elapsed = time.time() - started
         
         # 5. 组合结果消息（通知用）
-        final_msg = f"""🌟 阿里云盘签到结果
-
-👤 账号: {user_name}"""
+        final_msg = f"👤 账号: {user_name}"
         
         if display_phone:
             final_msg += f"\n📱 手机: {display_phone}"
@@ -970,20 +1023,35 @@ class AliYun:
 📝 签到: {sign_msg}"""
 
         if reward_info:
-            final_msg += f"\n🎁 奖励: {reward_info}"
+            final_msg += f"\n🎁 今日获得: {reward_info}"
+        elif is_success:
+            final_msg += "\n🎁 今日获得: 无（接口未返回奖励）"
+        else:
+            final_msg += "\n🎁 今日获得: 无（签到未成功）"
 
-        # Token更新状态
+        if self.signed_at:
+            final_msg += f"\n🕐 签到时间: {fmt_clock(self.signed_at)}"
+        else:
+            final_msg += f"\n🕐 完成时间: {fmt_clock()}"
+
+        final_msg += f"（耗时 {fmt_elapsed(elapsed)}）"
+
+        # Token 更新状态：必须区分「写回成功」与「仅检测到新值」
         if self.new_refresh_token:
-            if auto_update_token:
-                final_msg += f"\n🔄 Token: 已自动更新"
+            if not auto_update_token:
+                final_msg += "\n🔄 Token: 检测到新 token，请手动更新"
+            elif self.token_update_ok:
+                final_msg += "\n🔄 Token: 已自动写回"
+            elif self.token_update_ok is False:
+                final_msg += "\n🔄 Token: ⚠️ 写回失败，请手动更新 ALIYUN_REFRESH_TOKEN"
             else:
-                final_msg += f"\n🔄 Token: 检测到新token，请手动更新"
+                final_msg += "\n🔄 Token: 检测到新 token，请手动更新"
             
             # 只在明确允许时显示token
             if show_token_in_notification:
                 final_msg += f"\n💡 新token: {mask_sensitive_data(self.new_refresh_token, 'token')}"
 
-        final_msg += f"\n⏰ 时间: {datetime.now().strftime('%m-%d %H:%M')}"
+        final_msg += "\n" + "\n".join(self.token_lines())
         
         print(f"{'✅ 签到成功' if is_success else '❌ 签到失败'}")
         return final_msg, is_success
@@ -1034,6 +1102,7 @@ def main():
     success_count = 0
     total_count = len(tokens)
     results = []
+    run_start = time.time()
     
     for index, token in enumerate(tokens):
         try:
@@ -1054,7 +1123,8 @@ def main():
                 'index': index + 1,
                 'success': is_success,
                 'message': result_msg,
-                'account_id': aliyun.account_id
+                'account_id': aliyun.account_id,
+                'reward': aliyun.reward_info,
             })
             
             # 发送单个账号通知
@@ -1064,7 +1134,8 @@ def main():
             notify(title, result_msg)
             
         except Exception as e:
-            error_msg = f"账号{index + 1}: 执行异常 - {str(e)}"
+            error_msg = (f"账号{index + 1}: 执行异常 - {str(e)}\n"
+                         f"⏱️ 本次耗时: {fmt_elapsed(time.time() - run_start)}")
             print(f"❌ {error_msg}")
 
             # 保持 results 与账号数一致，避免汇总明细数量对不上
@@ -1073,6 +1144,7 @@ def main():
                 'success': False,
                 'message': error_msg,
                 'account_id': f"账号{index + 1}",
+                'reward': '',
             })
 
             title = f"阿里云盘账号{index + 1}签到失败"
@@ -1080,24 +1152,27 @@ def main():
     
     # 发送汇总通知
     if total_count > 1:
-        summary_msg = f"""📊 阿里云盘签到汇总
+        total_elapsed = time.time() - run_start
+        summary_msg = (f"📊 {total_count} 个账号｜✅ {success_count}｜"
+                       f"❌ {total_count - success_count}｜"
+                       f"成功率 {success_count/total_count*100:.0f}%\n"
+                       f"⏱️ 耗时 {fmt_elapsed(total_elapsed)}")
 
-📈 总计: {total_count}个账号
-✅ 成功: {success_count}个
-❌ 失败: {total_count - success_count}个
-📊 成功率: {success_count/total_count*100:.1f}%
-⏰ 完成时间: {datetime.now().strftime('%m-%d %H:%M')}"""
-        
-        # 添加详细结果（最多显示5个账号的详情）
+        # 明细（最多 5 个账号）
         if len(results) <= 5:
-            summary_msg += "\n\n📋 详细结果:"
             for result in results:
                 status_icon = "✅" if result['success'] else "❌"
-                summary_msg += f"\n{status_icon} 账号{result['index']}"
+                line = f"\n{status_icon} 账号{result['index']}"
+                if result.get('reward'):
+                    line += f"：{result['reward']}"
+                summary_msg += line
         
         notify("阿里云盘签到汇总", summary_msg)
     
     print(f"\n==== 阿里云盘签到完成 - 成功{success_count}/{total_count} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ====")
+    # 有账号失败时以非零退出，避免青龙把失败的运行显示成绿色
+    if total_count and success_count < total_count:
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
