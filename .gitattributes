@@ -1,0 +1,2 @@
+# 统一 LF：脚本要在 Linux 容器里跑，CRLF 会让 shebang 报 bad interpreter
+* text=auto eol=lf
