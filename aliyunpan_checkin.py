@@ -136,8 +136,8 @@ def update_qinglong_env_database(var_name, new_value, old_value=None):
 
         if rows:
             def _row_enabled(row):
-                """status 为空或 1 视为启用；0 表示用户在面板里禁用了这条变量。"""
-                return row[2] in (None, 1, '1')
+                """青龙约定：status 为空或 0 视为启用；1 表示用户在面板里禁用了这条变量。"""
+                return row[2] in (None, 0, '0')
 
             enabled_rows = [r for r in rows if _row_enabled(r)]
             disabled_count = len(rows) - len(enabled_rows)
@@ -205,7 +205,7 @@ def update_qinglong_env_database(var_name, new_value, old_value=None):
                 insert_vals.append('')
             if 'status' in columns:
                 insert_cols.append('status')
-                insert_vals.append(1)
+                insert_vals.append(0)  # 青龙：0=启用，1=禁用，新建变量必须落成启用
             if 'created_at' in columns:
                 insert_cols.append('created_at')
                 insert_vals.append(current_time)
@@ -366,7 +366,11 @@ def update_qinglong_env_api(var_name, new_value, old_value=None):
         matched_envs = [env for env in envs_data.get("data", []) if env.get("name") == var_name]
         # 与数据库路径保持一致：面板里被禁用的同名变量不参与合并，也不清空，
         # 否则等于把用户主动禁用的账号重新放回来。
-        enabled_envs = [env for env in matched_envs if env.get("status") not in (0, "0", False)]
+        # 青龙约定：status 为空或 0 为启用，1 为禁用。
+        enabled_envs = [
+            env for env in matched_envs
+            if env.get("status") in (None, 0, "0")
+        ]
 
         if matched_envs and not enabled_envs:
             print(f"⚠️  {var_name} 的同名变量全部处于禁用状态，跳过写回（不会改动这些被禁用的变量）")
